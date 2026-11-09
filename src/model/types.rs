@@ -17,7 +17,7 @@ use crate::registry;
 pub struct BrokerId(&'static str);
 
 impl BrokerId {
-    /// For a broker's own descriptor. Ids are lower-case ASCII (`coinbase`).
+    /// For a broker's own descriptor. Ids are lower-case ASCII (`acme`).
     pub const fn new(id: &'static str) -> Self {
         Self(id)
     }
@@ -406,7 +406,7 @@ pub enum AccountKind {
     Derivatives,
 }
 
-/// One account at a broker: a Coinbase portfolio, a Binance sub-account, a Kraken account.
+/// One account at a broker: a portfolio, a sub-account, or the account itself.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AccountRef {
     pub id: AccountId,

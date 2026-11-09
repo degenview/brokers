@@ -77,7 +77,7 @@ pub struct Descriptor {
     pub docs_url: &'static str,
     pub client_id: ClientIdRules,
     /// The market-data source whose symbols this broker can trade (the application's own slug for
-    /// it, such as `coinbase`). A chart from any other source is not tradable here.
+    /// it). A chart from any other source is not tradable here.
     pub market_source: &'static str,
     pub account_model: AccountModel,
     /// The smallest gap between two requests to this broker's private endpoints.

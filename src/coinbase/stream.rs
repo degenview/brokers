@@ -17,9 +17,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tungstenite::Message;
 
+use super::jwt::JwtSigner;
 use super::mapping::order_from_user;
 use crate::adapter::{Clock, StreamHandle, StreamTiming};
-use crate::auth::jwt::JwtSigner;
 use crate::model::events::{EventSink, StreamEvent};
 use crate::ws::{self, Backoff, Health};
 

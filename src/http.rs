@@ -436,7 +436,7 @@ mod tests {
             assert!(is_loopback_url(yes), "{yes}");
         }
         for no in [
-            "https://api.coinbase.com",
+            "https://api.example.com",
             "http://127.0.0.1.evil.example.com",
             "http://localhost.evil.example.com",
             "http://evil@127.0.0.1",

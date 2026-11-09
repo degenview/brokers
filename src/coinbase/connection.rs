@@ -4,6 +4,7 @@ use rust_decimal::Decimal;
 use std::sync::Arc;
 
 use super::descriptor::{DESCRIPTOR, FIELD_NAME, FIELD_PRIVATE_KEY, ID};
+use super::jwt::JwtSigner;
 use super::stream::{self, USER_HOST};
 use super::time::parse_rfc3339_ms;
 use super::wire::{
@@ -12,7 +13,6 @@ use super::wire::{
 use super::{BASE_URL, PREFIX};
 use crate::adapter::{Clock, Connection, Env, Session, StreamHandle, StreamTiming};
 use crate::auth::RequestSigner;
-use crate::auth::jwt::JwtSigner;
 use crate::error::{BrokerError, ErrorKind, Result};
 use crate::http::HttpClient;
 use crate::model::capabilities::{Capabilities, Tradability};

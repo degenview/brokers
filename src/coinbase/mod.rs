@@ -2,12 +2,13 @@
 //!
 //! Base `https://api.coinbase.com/api/v3/brokerage`. This is not the Coinbase Exchange ("pro")
 //! API, which has different hosts, keys and shapes. Authentication is a CDP API key signed into a
-//! short-lived JWT (see [`crate::auth::jwt`]).
+//! short-lived JWT (see [`jwt`]).
 
 mod connection;
 mod descriptor;
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
+pub mod jwt;
 mod mapping;
 mod orders;
 mod stream;
@@ -133,3 +134,6 @@ mod conformance_tests {
         run_all(|| Box::new(CoinbaseExchange::start()));
     }
 }
+
+#[cfg(test)]
+mod leak_tests;

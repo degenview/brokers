@@ -19,9 +19,9 @@ use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair};
 use serde_json::json;
 
-use super::der::{self, Sec1Error};
-use super::{RequestParts, RequestSigner};
 use crate::adapter::Clock;
+use crate::auth::der::{self, Sec1Error};
+use crate::auth::{RequestParts, RequestSigner};
 use crate::error::{BrokerError, ErrorKind, Result};
 
 /// How long a token lives, in seconds. Coinbase rejects longer.

@@ -227,8 +227,8 @@ mod tests {
     #[test]
     fn urls_split_into_host_and_port() {
         assert_eq!(
-            host_and_port("wss://advanced-trade-ws-user.coinbase.com"),
-            Some(("advanced-trade-ws-user.coinbase.com".to_owned(), 443))
+            host_and_port("wss://stream.example.com"),
+            Some(("stream.example.com".to_owned(), 443))
         );
         assert_eq!(
             host_and_port("ws://127.0.0.1:8123/x"),

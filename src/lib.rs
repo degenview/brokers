@@ -43,3 +43,50 @@ pub use runtime::{
 };
 pub use rust_decimal::Decimal;
 pub use secret::{Credentials, MemorySecretStore, SecretStore, SecretStoreError};
+
+#[cfg(test)]
+mod guard_tests {
+    use std::fs;
+    use std::path::Path;
+
+    fn sources(dir: &Path, out: &mut Vec<(String, String)>) {
+        for entry in fs::read_dir(dir).expect("read the source tree") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                // An adapter's own module is where its name belongs.
+                if path.file_name().is_some_and(|name| name == "coinbase") {
+                    continue;
+                }
+                sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = fs::read_to_string(&path).expect("read a source file");
+                out.push((path.display().to_string(), text));
+            }
+        }
+    }
+
+    /// The model, the traits, the HTTP and WebSocket layers, the runtime and the test support know
+    /// no exchange by name: adding one must not touch them. Only the crate root and the registry,
+    /// which list the adapters, may.
+    #[test]
+    fn generic_modules_name_no_exchange() {
+        let mut files = Vec::new();
+        sources(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(files.len() > 10, "the guard must actually read the tree");
+        for (path, text) in files {
+            if path.ends_with("src/lib.rs") || path.ends_with("src/registry.rs") {
+                continue;
+            }
+            let lower = text.to_lowercase();
+            for name in ["coinbase", "binance", "kraken"] {
+                assert!(
+                    !lower.contains(name),
+                    "{path} names `{name}`; broker-specific code belongs in that broker's module"
+                );
+            }
+        }
+    }
+}

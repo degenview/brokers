@@ -1,11 +1,10 @@
 //! Request signing. Each broker authenticates differently (a signed token, an HMAC over the
-//! query, an HMAC with a nonce); an adapter picks the signer it needs and the rest of the crate
-//! only sees [`RequestSigner`].
+//! query, an HMAC with a nonce); an adapter owns the signer it needs and the rest of the crate
+//! only sees [`RequestSigner`]. Signers specific to one broker live in that broker's module.
 
 use crate::error::Result;
 
 pub mod der;
-pub mod jwt;
 
 /// The parts of a request a signature may cover.
 #[derive(Clone, Copy, Debug)]

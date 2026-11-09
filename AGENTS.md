@@ -30,10 +30,12 @@ users; correctness and secrecy come before convenience.
 ```
 src/model/       pure types, validation, capabilities
 src/adapter.rs   Broker, Connection, Descriptor, Env
-src/auth/        RequestSigner and the signers
-src/http.rs      the HTTP client
-src/coinbase/    the Coinbase Advanced Trade adapter (feature `coinbase`)
-src/testing/     loopback mock exchange (feature `testing`)
+src/auth/        the RequestSigner trait (a broker's signer lives in its module)
+src/http.rs      the HTTP client;  src/ws.rs  blocking WebSocket plumbing
+src/submit.rs    record, send once, reconcile
+src/model/reducer.rs, src/runtime.rs   the shared book and the per-broker runtime
+src/coinbase/    the Coinbase Advanced Trade adapter (feature `coinbase`), with its fake exchange
+src/testing/     loopback mock server and the conformance suite (feature `testing`)
 docs/            coinbase.md (what was verified), adding-a-broker.md
 ```
 

@@ -589,4 +589,24 @@ mod tests {
             .count();
         assert_eq!(terminal, KEEP_FINISHED);
     }
+
+    #[test]
+    fn a_large_book_is_cheap_to_view() {
+        let mut book = Book::new();
+        for n in 0..500 {
+            let mut o = order(&format!("o{n:04}"), OrderStatus::Open, "0");
+            o.created_ms = Some(1_000 + n as i64);
+            book.apply_order(o, Source::Stream);
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            assert_eq!(book.views().len(), 500);
+        }
+        // Even in a debug build, 500 orders must not cost a visible fraction of a frame.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 }

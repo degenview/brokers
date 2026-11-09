@@ -8,11 +8,13 @@ later versions, a journal, an event sink and a clock) through small traits.
 | --- | --- |
 | `model` | Decimal types for products, orders, fills and balances; order validation; capabilities. Pure. |
 | `adapter`, `registry` | `Broker` / `Connection` traits and the list of compiled-in brokers. |
-| `auth` | Request signers (`jwt`: ES256 and Ed25519 for Coinbase). |
-| `http` | The one HTTP client: signed per request, no redirects, reads retried, **writes never**. |
+| `auth` | The `RequestSigner` trait (a broker's own signer lives in its module). |
+| `http`, `ws` | The one HTTP client (signed per request, no redirects, reads retried, **writes never**) and blocking WebSocket plumbing. |
+| `submit` | Record-then-send-once, and the lookup that settles an order whose outcome is unknown. |
+| `model::reducer`, `runtime` | The shared book (idempotent, ordered, notifies once) and the per-broker runtime that keeps it in sync with the exchange. |
 | `scrub`, `secret` | Credentials that cannot leak by `Debug`, and a scrubber for error text. |
 | `coinbase` (feature) | Coinbase Advanced Trade, spot. See [docs/coinbase.md](docs/coinbase.md). |
-| `testing` (feature) | A loopback mock exchange. Tests only. |
+| `testing` (feature) | A loopback mock exchange and the conformance suite every adapter must pass. Tests only. |
 
 ```rust,no_run
 use degenview_brokers::{registry, Credentials, Env, ProductId};
