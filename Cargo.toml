@@ -36,5 +36,9 @@ ring = "0.17"
 base64 = "0.22"
 getrandom = "0.4.3"
 
+[[example]]
+name = "mock_exchange"
+required-features = ["testing"]
+
 [lints.rust]
 unsafe_code = "forbid"
