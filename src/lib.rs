@@ -30,8 +30,8 @@ pub mod coinbase;
 pub mod testing;
 
 pub use adapter::{
-    AccountModel, Broker, ClientIdRules, Connection, CredentialField, Descriptor, Env, FieldKind,
-    MarketRef, ProductResolution, Session,
+    AccountModel, Broker, ClientIdRules, Clock, Connection, CredentialField, Descriptor, Env,
+    FieldKind, MarketRef, ProductResolution, Session, StreamHandle, StreamTiming, SystemClock,
 };
 pub use error::{BrokerError, ErrorKind, Result};
 pub use model::capabilities::{Capabilities, Tradability};
