@@ -30,6 +30,8 @@ pub fn is_loopback_url(url: &str) -> bool {
     let Some(rest) = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
+        .or_else(|| url.strip_prefix("ws://"))
+        .or_else(|| url.strip_prefix("wss://"))
     else {
         return false;
     };
@@ -429,6 +431,7 @@ mod tests {
             "http://localhost:1/x",
             "https://localhost",
             "http://[::1]:9",
+            "ws://127.0.0.1:7",
         ] {
             assert!(is_loopback_url(yes), "{yes}");
         }
@@ -439,6 +442,7 @@ mod tests {
             "http://evil@127.0.0.1",
             "http://127.0.0.1@evil.example.com",
             "ftp://127.0.0.1",
+            "wss://stream.example.com",
             "127.0.0.1",
             "",
         ] {

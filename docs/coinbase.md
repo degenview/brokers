@@ -49,7 +49,24 @@ that a reused `client_order_id` returns the existing order instead of creating a
 `DUPLICATE_CLIENT_ORDER_ID` failure is also handled (as "look it up"), because which of the two the
 live service does is not verified.
 
-The user WebSocket follows in a later version; this file is updated as each lands.
+**0.3** The user WebSocket (`wss://advanced-trade-ws-user.coinbase.com`), the shared reducer and
+the runtime:
+
+* Subscribes to `user` and `heartbeats`, each with a freshly signed token, within the documented
+  five seconds; reconnects by itself with jittered backoff, signing again each time.
+* A `sequence_num` jump is reported as a gap; the runtime then re-reads state. Whether the number
+  counts per connection or per product is not verified, so a false alarm only costs one re-read.
+* The `user` channel gives the filled amount and what is left, not the original size, so the size
+  is their sum. It carries no balances, so a fill or a finished order schedules a balance read.
+* The runtime reads state (REST) and applies stream messages after it, never before, so nothing
+  falls between the two; it reads again after a reconnect, a gap, the machine waking from sleep (a
+  long wait for the next message, measured on its own clock), an unknown submission outcome, and
+  every minute as a backstop.
+
+The shared conformance suite (`testing::conformance`) runs twelve scenarios against this adapter's
+mock: place / partial fill / fill, duplicate and stale messages, cancel requested versus done, a
+cancel racing a fill, a lost reply, a refusal, an invalid order, a stream drop, waking from sleep,
+a revoked key and a rate limit.
 
 ## Not verified against the live service
 

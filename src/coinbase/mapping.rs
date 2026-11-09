@@ -253,6 +253,65 @@ pub fn order_from(dto: &OrderDto) -> Option<LiveOrder> {
     })
 }
 
+/// An order from the `user` WebSocket channel. That channel states the filled amount
+/// (`cumulative_quantity`) and what is left (`leaves_quantity`), not the original size, so the size
+/// is their sum. `now_ms` stamps the update (the channel carries no update time).
+pub fn order_from_user(value: &Value, now_ms: i64) -> Option<LiveOrder> {
+    let text = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or("");
+    let number = |key: &str| parse_decimal(text(key));
+    let positive = |key: &str| number(key).filter(|v| *v > Decimal::ZERO);
+    let id = text("order_id");
+    let product = text("product_id");
+    if id.is_empty() || product.is_empty() {
+        return None;
+    }
+    let side = side_from(text("order_side")).or_else(|| side_from(text("side")))?;
+    let filled = number("cumulative_quantity").unwrap_or(Decimal::ZERO);
+    let size = number("leaves_quantity").map(|left| OrderSize::Base(filled + left));
+    let end_ms = parse_rfc3339_ms(text("end_time")).filter(|ms| *ms > 0);
+    let tif = match text("time_in_force") {
+        "GOOD_UNTIL_DATE_TIME" => Some(TimeInForce::GoodTilDate(end_ms.unwrap_or(0))),
+        "GOOD_UNTIL_CANCELLED" => Some(TimeInForce::GoodTilCancelled),
+        "IMMEDIATE_OR_CANCEL" => Some(TimeInForce::ImmediateOrCancel),
+        "FILL_OR_KILL" => Some(TimeInForce::FillOrKill),
+        _ => None,
+    };
+    let reason = ["cancel_reason", "reject_reason"]
+        .into_iter()
+        .map(text)
+        .find(|t| !t.is_empty() && *t != "REJECT_REASON_UNSPECIFIED" && *t != "Unspecified")
+        .map(str::to_owned);
+    Some(LiveOrder {
+        id: OrderId::new(id),
+        client_id: Some(text("client_order_id"))
+            .filter(|t| !t.is_empty())
+            .map(ClientOrderId::new),
+        product: ProductId::new(product),
+        side,
+        order_type: match text("order_type") {
+            "MARKET" => OrderType::Market,
+            "LIMIT" => OrderType::Limit,
+            "STOP_LIMIT" => OrderType::StopLimit,
+            _ => OrderType::Other,
+        },
+        status: status(text("status")),
+        tif,
+        size,
+        limit_price: positive("limit_price"),
+        stop_price: positive("stop_price"),
+        stop_direction: None,
+        post_only: text("post_only") == "true",
+        filled_size: filled,
+        filled_value: number("filled_value").unwrap_or(Decimal::ZERO),
+        average_price: positive("avg_price"),
+        fees: number("total_fees").unwrap_or(Decimal::ZERO),
+        created_ms: parse_rfc3339_ms(text("creation_time")),
+        updated_ms: Some(now_ms),
+        reason,
+        stop_triggered: text("trigger_status") == "STOP_TRIGGERED",
+    })
+}
+
 /// A fill. `None` when it is unusable (no id, no price or size).
 pub fn fill_from(dto: &FillDto) -> Option<LiveFill> {
     let price = parse_decimal(&dto.price).filter(|v| *v > Decimal::ZERO)?;
@@ -597,6 +656,29 @@ mod tests {
         assert_eq!(quote.id, "e1");
         assert!(fill(r#"{"trade_id":"t","order_id":"o","side":"BUY","price":"0","size":"1","trade_time":"2026-11-09T12:00:01Z"}"#).is_none());
         assert!(fill(r#"{"trade_id":"t","order_id":"o","side":"BUY","price":"1","size":"1","trade_time":"soon"}"#).is_none());
+    }
+
+    #[test]
+    fn user_channel_orders_derive_their_size_from_filled_plus_leaves() {
+        let value: Value = serde_json::from_str(
+            r#"{"order_id":"o","client_order_id":"c","product_id":"BTC-USD","order_side":"BUY",
+                "order_type":"LIMIT","status":"OPEN","cumulative_quantity":"0.0004","leaves_quantity":"0.0006",
+                "avg_price":"90000.00","limit_price":"90000.00","stop_price":"0","filled_value":"36",
+                "total_fees":"0.2","post_only":"true","creation_time":"2026-11-09T12:00:00.100Z",
+                "time_in_force":"GOOD_UNTIL_CANCELLED","end_time":"0001-01-01T00:00:00Z",
+                "reject_reason":"REJECT_REASON_UNSPECIFIED","cancel_reason":"User requested cancel"}"#,
+        )
+        .unwrap();
+        let order = order_from_user(&value, 777).unwrap();
+        assert_eq!(order.size, Some(OrderSize::Base(d("0.0010"))));
+        assert_eq!(order.filled_size, d("0.0004"));
+        assert_eq!(order.limit_price, Some(d("90000.00")));
+        assert_eq!(order.stop_price, None, "\"0\" means not applicable");
+        assert!(order.post_only);
+        assert_eq!(order.reason.as_deref(), Some("User requested cancel"));
+        assert_eq!(order.updated_ms, Some(777));
+        assert_eq!(order.created_ms, Some(1_794_225_600_100));
+        assert!(order_from_user(&serde_json::json!({"product_id":"BTC-USD"}), 0).is_none());
     }
 
     #[test]

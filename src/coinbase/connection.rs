@@ -1,21 +1,22 @@
 //! One authenticated Coinbase session.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use rust_decimal::Decimal;
+use std::sync::Arc;
 
 use super::descriptor::{DESCRIPTOR, FIELD_NAME, FIELD_PRIVATE_KEY, ID};
+use super::stream::{self, USER_HOST};
 use super::time::parse_rfc3339_ms;
 use super::wire::{
     AccountsPage, BestBidAsk, KeyPermissions, ProductDto, ProductsPage, parse_decimal,
 };
 use super::{BASE_URL, PREFIX};
-use crate::adapter::{Clock, Connection, Env, Session};
+use crate::adapter::{Clock, Connection, Env, Session, StreamHandle, StreamTiming};
+use crate::auth::RequestSigner;
 use crate::auth::jwt::JwtSigner;
 use crate::error::{BrokerError, ErrorKind, Result};
 use crate::http::HttpClient;
 use crate::model::capabilities::{Capabilities, Tradability};
+use crate::model::events::EventSink;
 use crate::model::orders::{
     CancelResult, EditOutcome, EditPreview, FeeSummary, FillFilter, HistoryFilter, OrderChange,
     OrderPreview, Page, PlacedOrder,
@@ -39,6 +40,9 @@ pub struct CoinbaseConnection {
     pub(super) http: HttpClient,
     session: Session,
     pub(super) clock: Arc<dyn Clock>,
+    signer: Arc<JwtSigner>,
+    ws_url: String,
+    timing: StreamTiming,
 }
 
 pub(super) fn path(suffix: &str) -> String {
@@ -71,14 +75,14 @@ impl CoinbaseConnection {
         }
         let name = credentials.get(FIELD_NAME).unwrap_or_default();
         let secret = credentials.get(FIELD_PRIVATE_KEY).unwrap_or_default();
-        let signer = JwtSigner::new(name, secret, Arc::clone(&env.clock))?;
+        let signer = Arc::new(JwtSigner::new(name, secret, Arc::clone(&env.clock))?);
         let scrubber = Scrubber::new(credentials.secret_values());
         let base = env.base_url().unwrap_or(BASE_URL);
         let http = HttpClient::new(
             base,
-            Arc::new(signer),
+            Arc::clone(&signer) as Arc<dyn RequestSigner>,
             scrubber,
-            Duration::from_millis(DESCRIPTOR.min_request_gap_ms),
+            env.request_gap(DESCRIPTOR.min_request_gap_ms),
         );
 
         let permissions: KeyPermissions = decode(
@@ -118,6 +122,9 @@ impl CoinbaseConnection {
             http,
             session,
             clock: Arc::clone(&env.clock),
+            signer,
+            ws_url: env.ws_url().unwrap_or(USER_HOST).to_owned(),
+            timing: env.stream_timing,
         })
     }
 
@@ -340,6 +347,18 @@ impl Connection for CoinbaseConnection {
 
     fn fee_summary(&self) -> Result<FeeSummary> {
         self.do_fee_summary()
+    }
+
+    fn open_stream(&self, sink: Arc<dyn EventSink>) -> Result<StreamHandle> {
+        Ok(stream::spawn(
+            stream::Config {
+                url: self.ws_url.clone(),
+                signer: Arc::clone(&self.signer),
+                clock: Arc::clone(&self.clock),
+                timing: self.timing,
+            },
+            sink,
+        ))
     }
 
     fn capabilities(&self, spec: &ProductSpec) -> Capabilities {

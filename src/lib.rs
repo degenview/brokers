@@ -17,9 +17,11 @@ pub mod error;
 pub mod http;
 pub mod model;
 pub mod registry;
+pub mod runtime;
 pub mod scrub;
 pub mod secret;
 pub mod submit;
+pub mod ws;
 
 #[cfg(feature = "coinbase")]
 pub mod coinbase;
@@ -35,5 +37,9 @@ pub use error::{BrokerError, ErrorKind, Result};
 pub use model::capabilities::{Capabilities, Tradability};
 pub use model::types::*;
 pub use model::validate;
+pub use runtime::{
+    BrokerRuntime, BrokerSnapshot, NoticeSink, Pending, PendingState, PendingView, RuntimeConfig,
+    Status, Waker,
+};
 pub use rust_decimal::Decimal;
 pub use secret::{Credentials, MemorySecretStore, SecretStore, SecretStoreError};

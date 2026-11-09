@@ -3,10 +3,13 @@
 //! never on an interface thread.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::Result;
 use crate::model::capabilities::Capabilities;
+use crate::model::events::EventSink;
 use crate::model::orders::{
     CancelResult, EditOutcome, EditPreview, FeeSummary, FillFilter, HistoryFilter, OrderChange,
     OrderPreview, Page, PlacedOrder,
@@ -139,18 +142,59 @@ impl Clock for SystemClock {
     }
 }
 
+/// How an account stream paces itself. The defaults suit production; tests use
+/// [`StreamTiming::fast`].
+#[derive(Clone, Copy, Debug)]
+pub struct StreamTiming {
+    /// How long one blocking read waits before the stream checks its flags.
+    pub read_timeout: Duration,
+    /// How long without any data before the stream is considered dead.
+    pub max_silence: Duration,
+    pub backoff_initial: Duration,
+    pub backoff_max: Duration,
+}
+
+impl Default for StreamTiming {
+    fn default() -> Self {
+        Self {
+            read_timeout: Duration::from_secs(1),
+            max_silence: Duration::from_secs(20),
+            backoff_initial: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+        }
+    }
+}
+
+impl StreamTiming {
+    /// Short intervals, for tests.
+    pub fn fast() -> Self {
+        Self {
+            read_timeout: Duration::from_millis(50),
+            max_silence: Duration::from_millis(600),
+            backoff_initial: Duration::from_millis(30),
+            backoff_max: Duration::from_millis(120),
+        }
+    }
+}
+
 /// The environment a connection runs in.
 #[derive(Clone)]
 pub struct Env {
     pub clock: Arc<dyn Clock>,
+    pub stream_timing: StreamTiming,
     base_url: Option<String>,
+    ws_url: Option<String>,
+    request_gap: Option<Duration>,
 }
 
 impl Default for Env {
     fn default() -> Self {
         Self {
             clock: Arc::new(SystemClock),
+            stream_timing: StreamTiming::default(),
             base_url: None,
+            ws_url: None,
+            request_gap: None,
         }
     }
 }
@@ -171,11 +215,85 @@ impl Env {
         self
     }
 
+    /// Points the account stream at a local mock. Same limits as
+    /// [`Env::with_loopback_base_url`].
+    #[cfg(any(test, feature = "testing", debug_assertions))]
+    #[must_use]
+    pub fn with_loopback_ws_url(mut self, url: impl Into<String>) -> Self {
+        self.ws_url = Some(url.into());
+        self
+    }
+
+    /// Spaces requests by less than the broker's minimum gap, so tests against a mock run fast.
+    /// Present only in debug and test builds.
+    #[cfg(any(test, feature = "testing", debug_assertions))]
+    #[must_use]
+    pub fn with_request_gap(mut self, gap: Duration) -> Self {
+        self.request_gap = Some(gap);
+        self
+    }
+
+    /// The gap between requests: the broker's own minimum unless a test lowered it.
+    pub fn request_gap(&self, descriptor_ms: u64) -> Duration {
+        self.request_gap
+            .unwrap_or_else(|| Duration::from_millis(descriptor_ms))
+    }
+
+    #[must_use]
+    pub fn with_stream_timing(mut self, timing: StreamTiming) -> Self {
+        self.stream_timing = timing;
+        self
+    }
+
     /// The override, if there is one and it names a loopback host.
     pub fn base_url(&self) -> Option<&str> {
         self.base_url
             .as_deref()
             .filter(|url| crate::http::is_loopback_url(url))
+    }
+
+    /// The stream address override, if there is one and it names a loopback host.
+    pub fn ws_url(&self) -> Option<&str> {
+        self.ws_url
+            .as_deref()
+            .filter(|url| crate::http::is_loopback_url(url))
+    }
+}
+
+/// A running account stream. Stopping it (or dropping it) ends its thread.
+pub struct StreamHandle {
+    stop: Arc<AtomicBool>,
+    reconnect: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl StreamHandle {
+    pub fn new(stop: Arc<AtomicBool>, reconnect: Arc<AtomicBool>, thread: JoinHandle<()>) -> Self {
+        Self {
+            stop,
+            reconnect,
+            thread: Some(thread),
+        }
+    }
+
+    /// Drops the current socket and connects again at once (after the machine woke, say).
+    pub fn reconnect(&self) {
+        self.reconnect.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops the stream and waits for its thread.
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        // Do not wait for the thread here: it notices the flag within one read timeout.
+        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
@@ -253,6 +371,10 @@ pub trait Connection: Send + Sync {
     ) -> Result<Option<LiveOrder>>;
 
     fn fee_summary(&self) -> Result<FeeSummary>;
+
+    /// Starts the live account stream. Events arrive on the stream's own thread through `sink`;
+    /// it reconnects by itself (with backoff and jitter) until the handle is stopped.
+    fn open_stream(&self, sink: Arc<dyn EventSink>) -> Result<StreamHandle>;
 }
 
 #[cfg(test)]

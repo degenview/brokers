@@ -10,6 +10,7 @@ mod descriptor;
 pub mod fake;
 mod mapping;
 mod orders;
+mod stream;
 mod time;
 mod wire;
 
@@ -118,3 +119,17 @@ mod tests {
 
 #[cfg(test)]
 mod orders_tests;
+
+#[cfg(test)]
+mod stream_tests;
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::fake::CoinbaseExchange;
+    use crate::testing::conformance::run_all;
+
+    #[test]
+    fn coinbase_passes_the_shared_conformance_suite() {
+        run_all(|| Box::new(CoinbaseExchange::start()));
+    }
+}
