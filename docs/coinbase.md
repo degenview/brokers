@@ -18,13 +18,38 @@ document, read on 2026-11-09. Coinbase moves these pages; re-check before relyin
   `portfolio_uuid`, `portfolio_type`). A CDP key is scoped to **one portfolio**; there is no
   portfolio switching inside a key.
 
-## What is implemented (0.1)
+## What is implemented
 
-Connect and validate a key; read balances (`/accounts`, paged by cursor, available and held
+**0.1** Connect and validate a key; read balances (`/accounts`, paged by cursor, available and held
 separately); read spot products with their increments, minimum and maximum sizes and trading flags
 (`/products`, `/products/{id}` with `get_tradability_status`); read the best bid and ask
-(`/best_bid_ask`); compute per-product capabilities. Orders, cancels, edits, history, fills and the
-user WebSocket follow in later versions; this file is updated as each lands.
+(`/best_bid_ask`); compute per-product capabilities.
+
+**0.2** Orders over REST:
+
+| Operation | Endpoint | Notes |
+| --- | --- | --- |
+| Preview | `POST /orders/preview` | Fees, total, estimated price, slippage, `errs` and warnings. Places nothing; treated as a read. |
+| Place | `POST /orders` | Sent once, with a `client_order_id`. A lost reply, a 5xx or an unreadable 2xx is `OutcomeUnknown`. |
+| Cancel | `POST /orders/batch_cancel` | In batches of 100. `success` means *requested*; the order stays live until its status says otherwise. |
+| Edit preview / edit | `POST /orders/edit_preview`, `/orders/edit` | Native edit of an `OPEN` limit or stop-limit order. Never cancel-and-replace. |
+| Read | `GET /orders/historical/{id}`, `/batch`, `/fills`; `GET /transaction_summary` | Cursor paging. |
+| Find by client id | `/orders/historical/batch` filtered locally | The `client_order_id` query parameter of `/historical/{id}` is deprecated, so the list is searched. |
+
+Order types: market (buy by quote or base amount, sell by base), limit GTC (optionally post-only) /
+GTD / FOK, stop-limit GTC / GTD. Not implemented: immediate-or-cancel limits (`sor_limit_ioc`),
+brackets and attached orders, TWAP, scaled, futures, equities.
+
+### Submitting safely (`submit`)
+
+The order is journalled before it is sent; it is sent once; an unfinished send ends as
+`OutcomeUnknown` and only a lookup by client order id settles it; "not listed" is believed only
+after two minutes; a resend is explicit, looks first, and reuses the same id. Coinbase documents
+that a reused `client_order_id` returns the existing order instead of creating another; a
+`DUPLICATE_CLIENT_ORDER_ID` failure is also handled (as "look it up"), because which of the two the
+live service does is not verified.
+
+The user WebSocket follows in a later version; this file is updated as each lands.
 
 ## Not verified against the live service
 
@@ -38,6 +63,9 @@ key is available, and this list is updated when it is.
   none is signed.
 * REST rate limits and headers. No current official figure was found; the client spaces requests
   120 ms apart and backs off on 429 with `Retry-After`.
+* What `/orders/edit` accepts in practice (the documentation never lists editable order types; the
+  failure codes suggest limit orders, and stop-limit is offered only if `edit_preview` accepts it).
+* The `order_status` query parameter's spelling for the list endpoints (`order_status=OPEN`, repeated).
 * Pagination of `/products` (`limit`/`offset` is used; the page size is a guess of 1000).
 * The `status` value for a live market (`online` is assumed).
 * Regional availability. Nothing documents it beyond the per-product flags and the

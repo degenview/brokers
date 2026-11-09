@@ -2,6 +2,8 @@
 //! broker.
 
 pub mod capabilities;
+pub mod orders;
+pub mod pending;
 pub mod types;
 pub mod validate;
 

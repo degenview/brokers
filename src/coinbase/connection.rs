@@ -16,9 +16,14 @@ use crate::auth::jwt::JwtSigner;
 use crate::error::{BrokerError, ErrorKind, Result};
 use crate::http::HttpClient;
 use crate::model::capabilities::{Capabilities, Tradability};
+use crate::model::orders::{
+    CancelResult, EditOutcome, EditPreview, FeeSummary, FillFilter, HistoryFilter, OrderChange,
+    OrderPreview, Page, PlacedOrder,
+};
 use crate::model::types::{
-    AccountId, AccountKind, AccountRef, Balance, BrokerId, OrderType, Permissions, ProductId,
-    ProductSpec, Quote, Restrictions, TifKind,
+    AccountId, AccountKind, AccountRef, Balance, BrokerId, ClientOrderId, LiveFill, LiveOrder,
+    OrderDraft, OrderId, OrderType, Permissions, ProductId, ProductSpec, Quote, Restrictions,
+    TifKind,
 };
 use crate::scrub::Scrubber;
 use crate::secret::Credentials;
@@ -31,23 +36,26 @@ const ACCOUNT_PAGE: usize = 250;
 const MAX_PAGES: usize = 40;
 
 pub struct CoinbaseConnection {
-    http: HttpClient,
+    pub(super) http: HttpClient,
     session: Session,
-    clock: Arc<dyn Clock>,
+    pub(super) clock: Arc<dyn Clock>,
 }
 
-fn path(suffix: &str) -> String {
+pub(super) fn path(suffix: &str) -> String {
     format!("{PREFIX}{suffix}")
 }
 
-fn unreadable(what: &str) -> BrokerError {
+pub(super) fn unreadable(what: &str) -> BrokerError {
     BrokerError::new(
         ErrorKind::Invalid,
         format!("Coinbase sent {what} that could not be read."),
     )
 }
 
-fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value, what: &str) -> Result<T> {
+pub(super) fn decode<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    what: &str,
+) -> Result<T> {
     serde_json::from_value(value).map_err(|_| unreadable(what))
 }
 
@@ -282,6 +290,58 @@ impl Connection for CoinbaseConnection {
         })
     }
 
+    fn preview(&self, draft: &OrderDraft) -> Result<OrderPreview> {
+        self.do_preview(draft)
+    }
+
+    fn place(&self, draft: &OrderDraft, client_id: &ClientOrderId) -> Result<PlacedOrder> {
+        self.do_place(draft, client_id)
+    }
+
+    fn cancel(&self, orders: &[OrderId]) -> Result<Vec<CancelResult>> {
+        self.do_cancel(orders)
+    }
+
+    fn preview_edit(&self, order: &LiveOrder, change: &OrderChange) -> Result<EditPreview> {
+        self.do_preview_edit(order, change)
+    }
+
+    fn amend(&self, order: &LiveOrder, change: &OrderChange) -> Result<EditOutcome> {
+        self.do_amend(order, change)
+    }
+
+    fn order(&self, id: &OrderId) -> Result<LiveOrder> {
+        self.do_order(id)
+    }
+
+    fn open_orders(&self) -> Result<Vec<LiveOrder>> {
+        self.do_open_orders()
+    }
+
+    fn order_history(
+        &self,
+        filter: &HistoryFilter,
+        cursor: Option<&str>,
+    ) -> Result<Page<LiveOrder>> {
+        self.do_order_history(filter, cursor)
+    }
+
+    fn fills(&self, filter: &FillFilter, cursor: Option<&str>) -> Result<Page<LiveFill>> {
+        self.do_fills(filter, cursor)
+    }
+
+    fn find_by_client_id(
+        &self,
+        client_id: &ClientOrderId,
+        since_ms: i64,
+    ) -> Result<Option<LiveOrder>> {
+        self.do_find_by_client_id(client_id, since_ms)
+    }
+
+    fn fee_summary(&self) -> Result<FeeSummary> {
+        self.do_fee_summary()
+    }
+
     fn capabilities(&self, spec: &ProductSpec) -> Capabilities {
         if !self.session.permissions.can_trade {
             return Capabilities::blocked(
@@ -320,39 +380,9 @@ mod tests {
     use super::*;
     use crate::adapter::Broker;
     use crate::coinbase::Coinbase;
+    use crate::coinbase::fake::{KEY_NAME, credentials, generate_key_pem as key_pem};
     use crate::testing::mock::{MockServer, Reply};
     use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
-    use ring::rand::SystemRandom;
-    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
-
-    pub(crate) const KEY_NAME: &str = "organizations/org-1/apiKeys/key-1";
-
-    /// A fresh signing key as the PEM Coinbase would show.
-    pub(crate) fn key_pem() -> String {
-        let rng = SystemRandom::new();
-        let document =
-            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
-        let outer = crate::auth::der::read(document.as_ref()).unwrap();
-        let version = crate::auth::der::read(outer.content).unwrap();
-        let algorithm = crate::auth::der::read(version.rest).unwrap();
-        let sec1 = crate::auth::der::read(algorithm.rest).unwrap().content;
-        let body = STANDARD.encode(sec1);
-        format!(
-            "-----BEGIN EC PRIVATE KEY-----\n{}\n-----END EC PRIVATE KEY-----\n",
-            body.as_bytes()
-                .chunks(64)
-                .map(|c| std::str::from_utf8(c).unwrap())
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    }
-
-    pub(crate) fn credentials(pem: &str) -> Credentials {
-        Credentials::new()
-            .with(FIELD_NAME, KEY_NAME)
-            .with(FIELD_PRIVATE_KEY, pem)
-    }
 
     fn connect(server: &MockServer, pem: &str) -> Result<Box<dyn Connection>> {
         Coinbase.connect(

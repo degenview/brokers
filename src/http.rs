@@ -169,9 +169,24 @@ impl HttpClient {
 
     /// A signed GET returning the JSON body. Retried on transient failure.
     pub fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value> {
+        self.read("GET", path, query, None)
+    }
+
+    /// A signed POST that **changes nothing** (a preview). Treated and retried like a read.
+    pub fn post_read(&self, path: &str, body: &Value) -> Result<Value> {
+        self.read("POST", path, &[], Some(body))
+    }
+
+    fn read(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+    ) -> Result<Value> {
         let mut last = None;
         for attempt in 0..READ_ATTEMPTS {
-            match self.once("GET", path, query, None) {
+            match self.once(method, path, query, body, false) {
                 Ok(value) => return Ok(value),
                 Err(error) if error.is_transient() && attempt + 1 < READ_ATTEMPTS => {
                     let wait = retry_wait(&error, attempt, jitter_seed());
@@ -184,10 +199,11 @@ impl HttpClient {
         Err(last.unwrap_or_else(|| BrokerError::new(ErrorKind::Transient, "The request failed.")))
     }
 
-    /// A signed POST with a JSON body. **Never retried.** A failure to complete the exchange is
-    /// [`ErrorKind::OutcomeUnknown`]: the broker may have acted.
+    /// A signed POST with a JSON body that **changes state**. Never retried. A failure to complete
+    /// the exchange, or a reply that cannot be read, is [`ErrorKind::OutcomeUnknown`]: the broker
+    /// may have acted.
     pub fn post(&self, path: &str, body: &Value) -> Result<Value> {
-        self.once("POST", path, &[], Some(body))
+        self.once("POST", path, &[], Some(body), true)
     }
 
     fn once(
@@ -196,8 +212,8 @@ impl HttpClient {
         path: &str,
         query: &[(&str, &str)],
         body: Option<&Value>,
+        write: bool,
     ) -> Result<Value> {
-        let write = body.is_some();
         // Sign after the wait: a token's two minutes should not be spent queueing.
         self.limiter.wait();
         let headers = self.signer.headers(&RequestParts {

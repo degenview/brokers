@@ -334,6 +334,7 @@ fn type_name(order_type: OrderType) -> &'static str {
         OrderType::Market => "Market",
         OrderType::Limit => "Limit",
         OrderType::StopLimit => "Stop-limit",
+        OrderType::Other => "This kind of",
     }
 }
 

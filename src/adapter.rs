@@ -7,8 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::Result;
 use crate::model::capabilities::Capabilities;
+use crate::model::orders::{
+    CancelResult, EditOutcome, EditPreview, FeeSummary, FillFilter, HistoryFilter, OrderChange,
+    OrderPreview, Page, PlacedOrder,
+};
 use crate::model::types::{
-    AccountRef, Balance, BrokerId, Permissions, ProductId, ProductSpec, Quote,
+    AccountRef, Balance, BrokerId, ClientOrderId, LiveFill, LiveOrder, OrderDraft, OrderId,
+    Permissions, ProductId, ProductSpec, Quote,
 };
 use crate::secret::Credentials;
 
@@ -206,6 +211,48 @@ pub trait Connection: Send + Sync {
     /// What can be done in this market with this credential. Pure: computed from the spec and the
     /// session's permissions.
     fn capabilities(&self, spec: &ProductSpec) -> Capabilities;
+
+    /// What the broker says `draft` would do. Places nothing.
+    fn preview(&self, draft: &OrderDraft) -> Result<OrderPreview>;
+
+    /// Places an order under `client_id`. **Sent once, never retried.** A failure to complete the
+    /// exchange is `ErrorKind::OutcomeUnknown`; resolve it with [`Connection::find_by_client_id`]
+    /// (see `submit`), never by sending again blindly.
+    fn place(&self, draft: &OrderDraft, client_id: &ClientOrderId) -> Result<PlacedOrder>;
+
+    /// Asks the broker to cancel orders. A `Requested` result is not a cancellation: the order
+    /// stays live until its own status says otherwise.
+    fn cancel(&self, orders: &[OrderId]) -> Result<Vec<CancelResult>>;
+
+    /// What an edit would do. Places and changes nothing. An error of kind `Unsupported` says the
+    /// order cannot be edited, with the reason.
+    fn preview_edit(&self, order: &LiveOrder, change: &OrderChange) -> Result<EditPreview>;
+
+    /// Changes an open order in place (or replaces it atomically). Never cancel-and-place.
+    fn amend(&self, order: &LiveOrder, change: &OrderChange) -> Result<EditOutcome>;
+
+    /// One order, fresh from the broker.
+    fn order(&self, id: &OrderId) -> Result<LiveOrder>;
+
+    /// Every order that may still trade.
+    fn open_orders(&self) -> Result<Vec<LiveOrder>>;
+
+    fn order_history(
+        &self,
+        filter: &HistoryFilter,
+        cursor: Option<&str>,
+    ) -> Result<Page<LiveOrder>>;
+
+    fn fills(&self, filter: &FillFilter, cursor: Option<&str>) -> Result<Page<LiveFill>>;
+
+    /// The order placed under `client_id` at or after `since_ms`, if the broker lists one.
+    fn find_by_client_id(
+        &self,
+        client_id: &ClientOrderId,
+        since_ms: i64,
+    ) -> Result<Option<LiveOrder>>;
+
+    fn fee_summary(&self) -> Result<FeeSummary>;
 }
 
 #[cfg(test)]

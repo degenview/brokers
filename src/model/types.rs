@@ -170,6 +170,9 @@ pub enum OrderType {
     /// A limit order that rests until the stop price trades. Spot venues rarely have a plain
     /// stop-market, so "stop" always means this.
     StopLimit,
+    /// A kind this crate can show and cancel but not create or edit (a bracket or TWAP placed in
+    /// the broker's own app, say).
+    Other,
 }
 
 /// Which way price must move through the stop to trigger it.

@@ -6,6 +6,10 @@
 
 mod connection;
 mod descriptor;
+#[cfg(any(test, feature = "testing"))]
+pub mod fake;
+mod mapping;
+mod orders;
 mod time;
 mod wire;
 
@@ -111,3 +115,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod orders_tests;

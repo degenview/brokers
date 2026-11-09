@@ -19,6 +19,7 @@ pub mod model;
 pub mod registry;
 pub mod scrub;
 pub mod secret;
+pub mod submit;
 
 #[cfg(feature = "coinbase")]
 pub mod coinbase;
