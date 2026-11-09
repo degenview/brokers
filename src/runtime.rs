@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use crate::adapter::{Broker, Connection, Env, Session, StreamHandle};
 use crate::error::{BrokerError, ErrorKind, Result};
+use crate::model::capabilities::Capabilities;
 use crate::model::events::{EventSink, StreamEvent};
 use crate::model::orders::{
     CancelOutcome, CancelResult, EditOutcome, EditPreview, FeeSummary, FillFilter, HistoryFilter,
@@ -144,6 +145,9 @@ pub struct BrokerSnapshot {
     pub fills: Vec<LiveFill>,
     pub pending: Vec<PendingView>,
     pub products: Arc<Vec<ProductSpec>>,
+    /// What can be done in each market in `products` with this credential, computed when the
+    /// market's rules are read. A market missing here has not been read yet.
+    pub capabilities: Arc<HashMap<ProductId, Capabilities>>,
     pub fees: Option<FeeSummary>,
     pub last_sync_ms: Option<i64>,
     pub last_error: Option<String>,
@@ -162,6 +166,7 @@ impl BrokerSnapshot {
             fills: Vec::new(),
             pending: Vec::new(),
             products: Arc::new(Vec::new()),
+            capabilities: Arc::new(HashMap::new()),
             fees: None,
             last_sync_ms: None,
             last_error: None,
@@ -170,6 +175,10 @@ impl BrokerSnapshot {
 
     pub fn product(&self, id: &ProductId) -> Option<&ProductSpec> {
         self.products.iter().find(|p| &p.id == id)
+    }
+
+    pub fn capabilities_of(&self, id: &ProductId) -> Option<&Capabilities> {
+        self.capabilities.get(id)
     }
 
     pub fn working_orders(&self) -> impl Iterator<Item = &OrderView> {
@@ -663,6 +672,12 @@ impl Worker {
         if let Some(products) = products {
             self.catalogue = products.iter().map(|p| (p.id.clone(), p.clone())).collect();
             self.catalogue_ms = Some(now);
+            self.snapshot.capabilities = Arc::new(
+                products
+                    .iter()
+                    .map(|p| (p.id.clone(), connection.capabilities(p)))
+                    .collect(),
+            );
             self.snapshot.products = Arc::new(products);
         }
         if fees.is_some() {
@@ -987,6 +1002,11 @@ impl Worker {
             None => products.push(spec.clone()),
         }
         self.snapshot.products = Arc::new(products);
+        if let Some(connection) = self.connection.clone() {
+            let mut capabilities = self.snapshot.capabilities.as_ref().clone();
+            capabilities.insert(spec.id.clone(), connection.capabilities(&spec));
+            self.snapshot.capabilities = Arc::new(capabilities);
+        }
         self.dirty = true;
         Ok(spec)
     }

@@ -213,6 +213,13 @@ fn connects_and_reads_the_account(exchange: &dyn Exchange) {
     assert!(snapshot.session.is_some());
     assert!(!snapshot.balances.is_empty(), "balances are read");
     assert!(!snapshot.products.is_empty(), "the market list is read");
+    assert!(
+        snapshot
+            .products
+            .iter()
+            .all(|p| snapshot.capabilities_of(&p.id).is_some()),
+        "what can be done in each market is known"
+    );
     assert!(snapshot.last_sync_ms.is_some());
     assert!(
         f.waker.0.load(Ordering::SeqCst) > 0,
