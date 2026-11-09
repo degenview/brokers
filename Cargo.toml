@@ -1,0 +1,38 @@
+[package]
+name = "degenview-brokers"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A venue-neutral trading model and broker adapters for DegenView, with Coinbase Advanced Trade first."
+license = "GPL-3.0-only"
+repository = "https://github.com/degenview/brokers"
+readme = "README.md"
+keywords = ["trading", "broker", "coinbase", "crypto", "degenview"]
+categories = ["api-bindings", "finance"]
+# Only what a consumer needs: no CI, no agent notes.
+include = ["/src", "/docs", "/README.md", "/LICENSE", "/Cargo.toml"]
+
+[features]
+default = ["coinbase"]
+# The Coinbase Advanced Trade adapter (spot).
+coinbase = []
+# A loopback mock exchange and the shared conformance scenarios, for this crate's tests and for
+# the application's. Never enable it in a shipped build.
+testing = []
+
+[dependencies]
+# Exact decimal prices, sizes and fees. Same pin as the application's journal work so the two never
+# resolve to different versions. `serde-str` writes and reads decimals as strings, which is how
+# exchanges send them.
+rust_decimal = { version = "1.43.0", default-features = false, features = ["std", "serde-str"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# Blocking HTTP with rustls and no redirects (see `http`). Matches the application's version.
+ureq = "3.4.2"
+# JWT signing (ES256 and Ed25519). Already in the application's tree through rustls.
+ring = "0.17"
+base64 = "0.22"
+getrandom = "0.4.3"
+
+[lints.rust]
+unsafe_code = "forbid"

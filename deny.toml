@@ -1,0 +1,53 @@
+# cargo-deny policy. Checked on every pull request (.github/workflows/supply-chain.yml).
+#
+#   cargo deny check
+#
+# Every change here is a decision about what a consumer's signed release may compile in, so review
+# it like code. This crate is a dependency of DegenView, whose own deny.toml it must satisfy.
+
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[sources]
+# crates.io and nowhere else: no git dependencies, no other registries, no forks.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# rustls is the TLS stack; a C one is not welcome.
+deny = [{ crate = "openssl-sys" }, { crate = "openssl" }, { crate = "native-tls" }]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]

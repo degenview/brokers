@@ -1,0 +1,64 @@
+name: CI
+
+# Tests every pull request, whatever branch it targets (stacked PRs target their parent branch).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Keep in step with the DegenView application's CI.
+  RUST_TOOLCHAIN: "1.99.0"
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            os: macos-latest
+          - name: linux
+            os: ubuntu-latest
+          - name: windows
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Build without default features
+        run: cargo build --locked --no-default-features
+
+      # No test reaches the network or a real exchange: every one talks to a loopback mock.
+      - name: Test
+        run: cargo test --locked --all-features
