@@ -144,10 +144,15 @@ impl CoinbaseConnection {
         if !dto.product_type.is_empty() && dto.product_type != "SPOT" {
             return None;
         }
+        // Every rule an order is checked against must be stated. A missing one is not replaced by
+        // a neighbour (a price increment is not a quote-size increment, and a missing minimum is
+        // not "no minimum"): a market whose rules are incomplete is not offered at all.
         let increment = |text: &str| parse_decimal(text).filter(|v| *v > Decimal::ZERO);
         let price_increment = increment(&dto.price_increment)?;
         let base_increment = increment(&dto.base_increment)?;
-        let quote_increment = increment(&dto.quote_increment).unwrap_or(price_increment);
+        let quote_increment = increment(&dto.quote_increment)?;
+        let base_min = parse_decimal(&dto.base_min_size).filter(|v| *v >= Decimal::ZERO)?;
+        let quote_min = parse_decimal(&dto.quote_min_size).filter(|v| *v >= Decimal::ZERO)?;
         Some(ProductSpec {
             id: ProductId::new(&dto.product_id),
             base: dto.base_currency_id.clone(),
@@ -160,9 +165,9 @@ impl CoinbaseConnection {
             price_increment,
             base_increment,
             quote_increment,
-            base_min: parse_decimal(&dto.base_min_size).unwrap_or(base_increment),
+            base_min,
             base_max: parse_decimal(&dto.base_max_size),
-            quote_min: parse_decimal(&dto.quote_min_size).unwrap_or(Decimal::ZERO),
+            quote_min,
             quote_max: parse_decimal(&dto.quote_max_size),
             restrictions: Restrictions {
                 trading_disabled: dto.trading_disabled || dto.is_disabled,
@@ -271,7 +276,10 @@ impl Connection for CoinbaseConnection {
         self.spec_from(&dto).ok_or_else(|| {
             BrokerError::new(
                 ErrorKind::Unsupported,
-                format!("{id} is not a spot market that can be traded here."),
+                format!(
+                    "{id} is not a spot market that can be traded here, or Coinbase did not state \
+                     all of its trading rules, so it is not offered."
+                ),
             )
         })
     }
@@ -431,15 +439,15 @@ mod tests {
                 200,
                 r#"{"products":[
                     {"product_id":"BTC-USD","base_currency_id":"BTC","quote_currency_id":"USD","display_name":"BTC-USD","price_increment":"0.01","base_increment":"0.00000001","quote_increment":"0.01","base_min_size":"0.00000001","base_max_size":"3400","quote_min_size":"1","quote_max_size":"150000000","status":"online","product_type":"SPOT"},
-                    {"product_id":"LTC-USD","base_currency_id":"LTC","quote_currency_id":"USD","price_increment":"0.01","base_increment":"0.001","quote_increment":"0.01","limit_only":true,"status":"online","product_type":"SPOT"},
-                    {"product_id":"OLD-USD","base_currency_id":"OLD","quote_currency_id":"USD","price_increment":"0.01","base_increment":"1","trading_disabled":true,"status":"delisted"},
+                    {"product_id":"LTC-USD","base_currency_id":"LTC","quote_currency_id":"USD","price_increment":"0.01","base_increment":"0.001","quote_increment":"0.01","base_min_size":"0.001","quote_min_size":"1","limit_only":true,"status":"online","product_type":"SPOT"},
+                    {"product_id":"OLD-USD","base_currency_id":"OLD","quote_currency_id":"USD","price_increment":"0.01","base_increment":"1","quote_increment":"0.01","base_min_size":"1","quote_min_size":"1","trading_disabled":true,"status":"delisted"},
                     {"product_id":"BTC-PERP","price_increment":"1","base_increment":"1","product_type":"FUTURE"},
                     {"product_id":"BROKEN-USD","price_increment":"","base_increment":"1"}
                 ]}"#,
             ),
             "/api/v3/brokerage/products/BTC-USD" => Reply::json(
                 200,
-                r#"{"product_id":"BTC-USD","base_currency_id":"BTC","quote_currency_id":"USD","price_increment":"0.01","base_increment":"0.00000001","status":"online","product_type":"SPOT","view_only":true}"#,
+                r#"{"product_id":"BTC-USD","base_currency_id":"BTC","quote_currency_id":"USD","price_increment":"0.01","base_increment":"0.00000001","quote_increment":"0.01","base_min_size":"0.00000001","quote_min_size":"1","status":"online","product_type":"SPOT","view_only":true}"#,
             ),
             "/api/v3/brokerage/best_bid_ask" => Reply::json(
                 200,
@@ -623,6 +631,64 @@ mod tests {
         assert!(
             query.contains("product_type=SPOT") && query.contains("get_tradability_status=true")
         );
+    }
+
+    #[test]
+    fn a_market_with_an_incomplete_rule_book_is_not_offered_and_nothing_is_guessed() {
+        let complete = serde_json::json!({
+            "product_id": "X-USD", "base_currency_id": "X", "quote_currency_id": "USD",
+            "price_increment": "0.01", "base_increment": "0.001", "quote_increment": "0.05",
+            "base_min_size": "0.01", "quote_min_size": "2", "status": "online", "product_type": "SPOT"
+        });
+        // Each rule left out, or unusable, on its own.
+        let mut broken = Vec::new();
+        for field in ["quote_increment", "base_min_size", "quote_min_size"] {
+            let mut missing = complete.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            broken.push((format!("{field} missing"), missing));
+            let mut blank = complete.clone();
+            blank[field] = "".into();
+            broken.push((format!("{field} blank"), blank));
+        }
+        let mut zero_increment = complete.clone();
+        zero_increment["quote_increment"] = "0".into();
+        broken.push(("quote_increment zero".to_owned(), zero_increment));
+
+        for (name, product) in broken {
+            let listing = serde_json::json!({ "products": [product.clone()] }).to_string();
+            let single = product.to_string();
+            let server = MockServer::start(move |request| match request.path() {
+                "/api/v3/brokerage/key_permissions" => Reply::json(200, PERMISSIONS),
+                "/api/v3/brokerage/products" => Reply::json(200, listing.clone()),
+                "/api/v3/brokerage/products/X-USD" => Reply::json(200, single.clone()),
+                _ => Reply::json(404, "{}"),
+            });
+            let connection = connect(&server, &key_pem()).unwrap();
+            assert!(
+                connection.products().unwrap().is_empty(),
+                "{name}: the market is not offered"
+            );
+            let error = connection.product(&ProductId::new("X-USD")).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Unsupported, "{name}");
+            assert!(
+                error.to_string().contains("trading rules"),
+                "{name}: {error}"
+            );
+        }
+
+        // A stated zero minimum is a rule; a complete book is accepted as stated.
+        let mut no_minimum = complete.clone();
+        no_minimum["quote_min_size"] = "0".into();
+        let listing = serde_json::json!({ "products": [no_minimum] }).to_string();
+        let server = MockServer::start(move |request| match request.path() {
+            "/api/v3/brokerage/key_permissions" => Reply::json(200, PERMISSIONS),
+            _ => Reply::json(200, listing.clone()),
+        });
+        let products = connect(&server, &key_pem()).unwrap().products().unwrap();
+        assert_eq!(products.len(), 1);
+        assert_eq!(products[0].quote_increment.to_string(), "0.05");
+        assert_eq!(products[0].quote_min.to_string(), "0");
+        assert_eq!(products[0].base_min.to_string(), "0.01");
     }
 
     #[test]
