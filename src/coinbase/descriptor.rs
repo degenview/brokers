@@ -48,6 +48,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
     market_source: "coinbase",
     account_model: AccountModel::Portfolios,
     // Coinbase's private-endpoint limits are not documented; stay well under any plausible one.
+    real_money: true,
     min_request_gap_ms: 120,
 };
 
@@ -72,5 +73,17 @@ pub static SANDBOX_DESCRIPTOR: Descriptor = Descriptor {
     },
     market_source: "coinbase",
     account_model: AccountModel::Portfolios,
+    real_money: false,
     min_request_gap_ms: 120,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_sandbox_is_not_real_money() {
+        assert!(DESCRIPTOR.real_money);
+        assert!(!SANDBOX_DESCRIPTOR.real_money);
+    }
+}
