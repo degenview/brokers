@@ -49,6 +49,39 @@ that a reused `client_order_id` returns the existing order instead of creating a
 `DUPLICATE_CLIENT_ORDER_ID` failure is also handled (as "look it up"), because which of the two the
 live service does is not verified.
 
+What counts as "not sent", and what does not:
+
+* **Not sent** is said only when nothing left the machine (the order could not be recorded, failed
+  local validation, or could not be signed) or Coinbase clearly refused it (a 400, 401, 403, 409 or
+  422, or a `success: false` answer with a reason).
+* **Unknown** is anything else that happened after the request went out: a connection that failed
+  part-way, a 5xx, a redirect, a status that is not on the list, a success whose body cannot be
+  read, or a success without an order id. The journal entry stays and a lookup settles it.
+* Once Coinbase has accepted an order, failing to update the journal never takes that back: the
+  order is returned as placed (`submit::Submitted::unsettled` carries the journal's error) and the
+  entry is closed on a later reconcile round.
+* An unreadable journal is not an empty one. The runtime publishes `journal_error`, refuses new
+  orders (`BrokerSnapshot::can_send_orders` is false) and keeps trying to read it; reading,
+  cancelling and editing keep working. A pending item leaves the screen only when the journal has
+  let go of it.
+
+Other rules worth knowing:
+
+* **A market's rules are not guessed.** If Coinbase does not state the quote increment, the base
+  minimum or the quote minimum of a market, the market is not offered ("did not state all of its
+  trading rules") rather than taking another field's value. This is fail-closed on a doubt that
+  could not be checked against a full live product list: if real products omit one of these, they
+  will appear untradable here and this section should say which.
+* **Cancel batches.** A cancel of more than 100 orders is sent in batches. The results of batches
+  that went through are kept; a batch whose answer was lost is reported as `Unknown` (the runtime
+  reads those orders again), and later batches are reported as not sent.
+* **Order updates.** A finished order is never reopened and its fill never goes down, but it does
+  learn a bigger fill and, from a read of the order itself, its final fee and average price. A
+  stream message that says only "open" after "cancel queued" is treated as old; the read that
+  follows every cancel decides.
+* **Stream errors** are scrubbed of credentials and tokens and cut to 200 characters before they
+  are shown.
+
 **0.3** The user WebSocket (`wss://advanced-trade-ws-user.coinbase.com`), the shared reducer and
 the runtime:
 
@@ -63,10 +96,11 @@ the runtime:
   long wait for the next message, measured on its own clock), an unknown submission outcome, and
   every minute as a backstop.
 
-The shared conformance suite (`testing::conformance`) runs twelve scenarios against this adapter's
+The shared conformance suite (`testing::conformance`) runs sixteen scenarios against this adapter's
 mock: place / partial fill / fill, duplicate and stale messages, cancel requested versus done, a
 cancel racing a fill, a lost reply, a refusal, an invalid order, a stream drop, waking from sleep,
-a revoked key and a rate limit.
+a revoked key and a rate limit, and four on the record of unconfirmed orders (unreadable later,
+unreadable at start, an accepted order whose record cannot be closed, a failed lookup).
 
 ## Not verified against the live service
 
