@@ -21,12 +21,36 @@ use super::jwt::JwtSigner;
 use super::mapping::order_from_user;
 use crate::adapter::{Clock, StreamHandle, StreamTiming};
 use crate::model::events::{EventSink, StreamEvent};
+use crate::scrub::Scrubber;
 use crate::ws::{self, Backoff, Health};
 
 pub(super) const USER_HOST: &str = "wss://advanced-trade-ws-user.coinbase.com";
 
+/// The longest reason that is shown for a dropped connection.
+const REASON_LIMIT: usize = 200;
+
+/// Text that came from the server or the network, made safe to show and to log: credentials and
+/// tokens removed (the server may echo the subscription it was sent), control characters dropped,
+/// and cut short.
+fn safe_reason(scrubber: &Scrubber, text: &str) -> String {
+    let cleaned: String = scrubber
+        .scrub(text)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() > REASON_LIMIT {
+        let mut cut: String = cleaned.chars().take(REASON_LIMIT).collect();
+        cut.push('…');
+        cut
+    } else {
+        cleaned
+    }
+}
+
 pub(super) struct Config {
     pub url: String,
+    pub scrubber: Scrubber,
     pub signer: Arc<JwtSigner>,
     pub clock: Arc<dyn Clock>,
     pub timing: StreamTiming,
@@ -54,7 +78,10 @@ fn run(config: &Config, sink: &dyn EventSink, stop: &AtomicBool, reconnect: &Ato
             // A requested reconnect starts again at once.
             Ended::Reconnect => continue,
             Ended::Failed(reason) => {
-                sink.event(StreamEvent::Disconnected { reason });
+                // The one place a reason leaves this module, whatever produced it.
+                sink.event(StreamEvent::Disconnected {
+                    reason: safe_reason(&config.scrubber, &reason),
+                });
                 backoff.wait(stop);
             }
         }

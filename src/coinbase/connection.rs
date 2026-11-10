@@ -353,6 +353,7 @@ impl Connection for CoinbaseConnection {
         Ok(stream::spawn(
             stream::Config {
                 url: self.ws_url.clone(),
+                scrubber: self.http.scrubber().clone(),
                 signer: Arc::clone(&self.signer),
                 clock: Arc::clone(&self.clock),
                 timing: self.timing,

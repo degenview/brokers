@@ -246,3 +246,67 @@ fn nothing_is_sent_to_a_server_that_is_down_and_it_keeps_trying_with_backoff() {
     });
     handle.stop();
 }
+
+#[test]
+fn a_server_error_that_echoes_the_subscription_is_scrubbed_and_short() {
+    use super::fake::KEY_NAME;
+    let rest = FakeCoinbase::start();
+    let stream = FakeStream::start();
+    let pem = generate_key_pem();
+    let key_line = pem
+        .lines()
+        .map(str::trim)
+        .find(|line| line.len() > 12 && !line.starts_with("-----"))
+        .expect("a line of key material")
+        .to_owned();
+    let sink = Arc::new(Collector::default());
+    let _handle = Coinbase
+        .connect(
+            &credentials(&pem),
+            &Env::default()
+                .with_loopback_base_url(rest.url())
+                .with_loopback_ws_url(stream.url.clone())
+                .with_stream_timing(StreamTiming::fast()),
+        )
+        .unwrap()
+        .open_stream(sink.clone())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while stream.subscribes().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let subscribe = stream.subscribes().remove(0);
+    let token = subscribe["jwt"]
+        .as_str()
+        .expect("a token was sent")
+        .to_owned();
+
+    // A server that answers a bad subscription by quoting it back, at length, with a newline.
+    let echoed = format!(
+        "invalid subscription {subscribe} for {KEY_NAME} key {key_line}\n{}",
+        "x".repeat(3_000)
+    );
+    stream.push(&serde_json::json!({"type": "error", "message": echoed}).to_string());
+    sink.wait_for("the disconnect", |e| {
+        e.iter()
+            .any(|e| matches!(e, StreamEvent::Disconnected { .. }))
+    });
+    let reason = sink
+        .events()
+        .into_iter()
+        .find_map(|e| match e {
+            StreamEvent::Disconnected { reason } => Some(reason),
+            _ => None,
+        })
+        .unwrap();
+    for secret in [token.as_str(), KEY_NAME, key_line.as_str()] {
+        assert!(!reason.contains(secret), "leaked {secret}: {reason}");
+    }
+    assert!(!reason.contains("eyJ"), "{reason}");
+    assert!(!reason.contains('\n'));
+    assert!(
+        reason.chars().count() <= 260,
+        "a server's words are cut short: {} characters",
+        reason.chars().count()
+    );
+}
