@@ -653,3 +653,77 @@ fn an_accepted_order_is_placed_even_if_the_journal_cannot_be_updated() {
     );
     assert_eq!(fake.posts_to_create(), 1);
 }
+
+fn many_resting_orders(fake: &FakeCoinbase, count: usize) -> Vec<OrderId> {
+    use super::fake::FakeOrder;
+    fake.with_state(|state| {
+        (0..count)
+            .map(|n| {
+                let id = format!("bulk-{n}");
+                state.orders.push(FakeOrder {
+                    id: id.clone(),
+                    client_id: format!("bulk-client-{n}"),
+                    product: "BTC-USD".to_owned(),
+                    side: "BUY".to_owned(),
+                    status: "OPEN".to_owned(),
+                    configuration: serde_json::json!({"limit_limit_gtc": {
+                        "base_size": "0.001", "limit_price": "90000.00", "post_only": false}}),
+                    filled_size: "0".to_owned(),
+                    created_time: "2026-11-09T12:00:00.000Z".to_owned(),
+                });
+                OrderId::new(id)
+            })
+            .collect()
+    })
+}
+
+#[test]
+fn a_cancel_that_fails_in_a_later_batch_keeps_what_the_earlier_batches_did() {
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    // 250 orders go out in batches of 100, 100 and 50; the second batch's answer is a 502.
+    let ids = many_resting_orders(&fake, 250);
+    fake.with_state(|s| s.fail_cancel_batch = Some(1));
+
+    let results = connection.cancel(&ids).unwrap();
+    assert_eq!(results.len(), 250, "every order is accounted for");
+    assert!(
+        results[..100]
+            .iter()
+            .all(|r| r.outcome == CancelOutcome::Requested),
+        "the first batch was sent and answered"
+    );
+    assert!(
+        results[100..200]
+            .iter()
+            .all(|r| matches!(r.outcome, CancelOutcome::Unknown(_))),
+        "the second may have been carried out: not 'refused'"
+    );
+    assert!(
+        results[200..].iter().all(
+            |r| matches!(&r.outcome, CancelOutcome::Rejected(text) if text.contains("Not sent"))
+        ),
+        "the third was not tried"
+    );
+    assert_eq!(
+        fake.with_state(|s| s.cancel_batches_seen),
+        2,
+        "and not sent"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|r| r.order_id.clone())
+            .collect::<Vec<_>>(),
+        ids,
+        "in the order asked"
+    );
+
+    // A request that fails at the first batch has nothing to keep and fails as a whole.
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    let ids = many_resting_orders(&fake, 150);
+    fake.with_state(|s| s.fail_cancel_batch = Some(0));
+    let error = connection.cancel(&ids).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::OutcomeUnknown);
+}

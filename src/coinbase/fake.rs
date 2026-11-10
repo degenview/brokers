@@ -72,6 +72,10 @@ pub struct State {
     pub refuse_create_with: Option<String>,
     /// Answer the next N requests with 429.
     pub rate_limit_next: usize,
+    /// Answer the Nth (from 0) `batch_cancel` request with a 502.
+    pub fail_cancel_batch: Option<usize>,
+    /// How many `batch_cancel` requests were received.
+    pub cancel_batches_seen: usize,
     /// What `cancel` says for each order, instead of success.
     pub cancel_failure: Option<String>,
     /// What `edit` says instead of success.
@@ -302,6 +306,11 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
             }
         }
         ("POST", "/orders/batch_cancel") => {
+            let batch = state.cancel_batches_seen;
+            state.cancel_batches_seen += 1;
+            if state.fail_cancel_batch == Some(batch) {
+                return Reply::json(502, r#"{"message":"bad gateway"}"#);
+            }
             let body: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
             let ids: Vec<String> = body["order_ids"]
                 .as_array()

@@ -60,6 +60,9 @@ pub enum CancelOutcome {
     BeingReplaced,
     /// The broker refused, with this sentence.
     Rejected(String),
+    /// The request was sent and the answer was lost or unreadable: the order may have been
+    /// cancelled. Read it again; do not assume either way.
+    Unknown(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

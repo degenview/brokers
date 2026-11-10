@@ -1247,7 +1247,20 @@ impl Worker {
     }
 
     fn cancel(&mut self, ids: &[OrderId]) -> Result<Vec<CancelResult>> {
-        let results = self.with_connection(|c| c.cancel(ids))?;
+        let results = match self.with_connection(|c| c.cancel(ids)) {
+            Ok(results) => results,
+            Err(error) => {
+                // The request may have been carried out even though no answer came back: read
+                // every order again to see.
+                if error.kind == ErrorKind::OutcomeUnknown {
+                    for id in ids {
+                        self.schedule_refetch(id.clone(), 0);
+                    }
+                    self.dirty = true;
+                }
+                return Err(error);
+            }
+        };
         let now = self.now();
         for result in &results {
             match &result.outcome {
@@ -1259,7 +1272,8 @@ impl Worker {
                 // The broker knows better than we do: read how it ended.
                 CancelOutcome::AlreadyFilled
                 | CancelOutcome::NotFound
-                | CancelOutcome::BeingReplaced => {
+                | CancelOutcome::BeingReplaced
+                | CancelOutcome::Unknown(_) => {
                     self.schedule_refetch(result.order_id.clone(), 0);
                 }
                 CancelOutcome::Rejected(_) => {}
