@@ -426,7 +426,19 @@ impl Connection for CoinbaseConnection {
     }
 
     fn order(&self, id: &OrderId) -> Result<LiveOrder> {
-        self.do_order(id)
+        let found = self.do_order(id);
+        if self.sandbox
+            && let Err(error) = &found
+            && matches!(error.kind, ErrorKind::Rejected | ErrorKind::Invalid)
+        {
+            // The sandbox answers every lookup by id with a 400 ("invalid OrderId {order_id}"),
+            // the id of an order it just accepted included: it keeps nothing it is sent.
+            return Err(BrokerError::new(
+                ErrorKind::NotFound,
+                "The sandbox does not keep the orders it is sent, so this one cannot be looked up.",
+            ));
+        }
+        found
     }
 
     fn open_orders(&self) -> Result<Vec<LiveOrder>> {

@@ -84,6 +84,9 @@ pub struct State {
     pub edit_failure: Option<String>,
     /// Read-only mode: `can_trade` false in the key permissions.
     pub view_only_key: bool,
+    /// Answer every lookup of one order by id with the 400 Coinbase's sandbox gives, which does
+    /// not keep the orders it is sent.
+    pub order_lookup_invalid: bool,
     /// Answer every request 401, as a revoked key would.
     pub revoked: bool,
     pub fills: Vec<Value>,
@@ -398,6 +401,12 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
         }
         ("GET", other) if other.starts_with("/orders/historical/") => {
             let id = other.trim_start_matches("/orders/historical/");
+            if state.order_lookup_invalid {
+                return Reply::json(
+                    400,
+                    r#"{"error":"INVALID_ARGUMENT","message":"invalid OrderId {order_id} passed to endpoint","error_details":""}"#,
+                );
+            }
             match state.orders.iter().find(|o| o.id == id) {
                 Some(order) => Reply::json(200, json!({ "order": order_json(order) }).to_string()),
                 None => Reply::json(404, r#"{"message":"order not found","error":"NOT_FOUND"}"#),

@@ -849,6 +849,9 @@ impl Worker {
         };
         match connection.order(id) {
             Ok(order) => self.apply_order(order, Source::Refetch),
+            // A lookup that finds nothing is not a failure to report: the order is not visible
+            // yet, or the broker keeps no such record. The next read of the order list says.
+            Err(error) if error.kind == ErrorKind::NotFound => {}
             Err(error) => self.note_error(&error),
         }
     }
