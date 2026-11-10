@@ -348,19 +348,35 @@ impl CoinbaseConnection {
         })
     }
 
+    /// Every order that may still trade. Coinbase refuses a listing that names several active
+    /// statuses (it said so on the first real run), so each is asked for on its own and the answers
+    /// are merged, an order once even if two answers carry it.
     pub(super) fn do_open_orders(&self) -> Result<Vec<LiveOrder>> {
         let filter = HistoryFilter::default();
-        let mut orders = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..MAX_OPEN_PAGES {
-            let page = self.orders_page(&WORKING_STATUSES, &filter, cursor.as_deref(), MAX_PAGE)?;
-            orders.extend(page.items);
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => return Ok(orders),
+        let mut orders: Vec<LiveOrder> = Vec::new();
+        for status in WORKING_STATUSES {
+            let mut cursor: Option<String> = None;
+            let mut finished = false;
+            for _ in 0..MAX_OPEN_PAGES {
+                let page = self.orders_page(&[status], &filter, cursor.as_deref(), MAX_PAGE)?;
+                for order in page.items {
+                    if !orders.iter().any(|known| known.id == order.id) {
+                        orders.push(order);
+                    }
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            if !finished {
+                return Err(unreadable("an order list that never ends"));
             }
         }
-        Err(unreadable("an order list that never ends"))
+        Ok(orders)
     }
 
     pub(super) fn do_order_history(
@@ -374,6 +390,14 @@ impl CoinbaseConnection {
             .flat_map(|status| mapping::status_query(*status).iter().copied())
             .collect();
         let limit = if filter.limit == 0 { 100 } else { filter.limit };
+        // Several statuses with an active one among them is refused by Coinbase, and one cursor
+        // cannot page through several listings. So ask for everything and keep what was wanted.
+        if statuses.len() > 1 && statuses.iter().any(|s| WORKING_STATUSES.contains(s)) {
+            let mut page = self.orders_page(&[], filter, cursor, limit)?;
+            page.items
+                .retain(|order| filter.statuses.contains(&order.status));
+            return Ok(page);
+        }
         self.orders_page(&statuses, filter, cursor, limit)
     }
 

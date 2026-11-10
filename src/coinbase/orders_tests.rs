@@ -507,6 +507,73 @@ fn orders_stay_open_until_they_leave_the_working_set_and_history_filters_by_stat
     assert!(query.contains("order_status=FILLED"), "{query}");
 }
 
+/// Coinbase refuses a listing that asks for several active statuses at once. The working set is
+/// every active status, so each is asked for on its own and the answers are merged, once each.
+#[test]
+fn the_working_orders_are_listed_one_active_status_at_a_time() {
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    for n in 0..5 {
+        connection
+            .place(&limit_buy(), &ClientOrderId::new(format!("w{n}")))
+            .unwrap();
+    }
+    fake.with_state(|s| {
+        for (order, status) in
+            s.orders
+                .iter_mut()
+                .zip(["OPEN", "PENDING", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED"])
+        {
+            order.status = status.to_owned();
+        }
+    });
+    let open = connection.open_orders().expect("the working orders");
+    assert_eq!(open.len(), 5, "every active status is listed: {open:?}");
+    let mut ids: Vec<_> = open.iter().map(|o| o.id.clone()).collect();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    ids.dedup();
+    assert_eq!(ids.len(), 5, "and none twice");
+}
+
+/// A history filter that spans several statuses, one of them active, is answered too.
+#[test]
+fn a_history_filter_across_active_statuses_is_not_sent_as_several_at_once() {
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    for n in 0..3 {
+        connection
+            .place(&limit_buy(), &ClientOrderId::new(format!("h{n}")))
+            .unwrap();
+    }
+    fake.with_state(|s| {
+        s.orders[0].status = "OPEN".to_owned();
+        s.orders[1].status = "QUEUED".to_owned();
+        s.orders[2].status = "FILLED".to_owned();
+    });
+    let pending = connection
+        .order_history(
+            &HistoryFilter {
+                statuses: vec![OrderStatus::Pending],
+                ..HistoryFilter::default()
+            },
+            None,
+        )
+        .expect("pending alone (PENDING and QUEUED)");
+    assert_eq!(pending.items.len(), 1);
+    let mixed = connection
+        .order_history(
+            &HistoryFilter {
+                statuses: vec![OrderStatus::Open, OrderStatus::Filled],
+                ..HistoryFilter::default()
+            },
+            None,
+        )
+        .expect("an active and a finished status together");
+    let mut statuses: Vec<_> = mixed.items.iter().map(|o| o.status).collect();
+    statuses.sort_by_key(|s| format!("{s:?}"));
+    assert_eq!(statuses, vec![OrderStatus::Filled, OrderStatus::Open]);
+}
+
 #[test]
 fn fills_fees_and_a_missing_order_are_read() {
     let fake = FakeCoinbase::start();

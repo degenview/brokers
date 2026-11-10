@@ -373,6 +373,15 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
         }
         ("GET", "/orders/historical/batch") => {
             let wanted = query_values(request, "order_status");
+            // Coinbase's own rule, met on the first real run: active statuses are asked for one
+            // at a time, never together or mixed with others.
+            const ACTIVE: [&str; 5] = ["OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED"];
+            if wanted.len() > 1 && wanted.iter().any(|status| ACTIVE.contains(status)) {
+                return Reply::json(
+                    400,
+                    r#"{"error":"INVALID_ARGUMENT","message":"Cannot pass multiple statuses when requesting active orders (OPEN, PENDING, QUEUED, EDIT_QUEUED, or CANCEL_QUEUED)","error_details":""}"#,
+                );
+            }
             let orders: Vec<Value> = state
                 .orders
                 .iter()
