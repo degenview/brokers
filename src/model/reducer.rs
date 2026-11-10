@@ -6,9 +6,10 @@
 //! from a stream and from REST reads, duplicated and out of order, so applying one is **idempotent**
 //! and a stale one is ignored:
 //!
-//! * a finished order stays finished;
+//! * a finished order stays finished (but still learns a bigger fill, and its final fee and price
+//!   from a read of the order itself);
 //! * the filled amount never goes down;
-//! * a bare `Pending` never undoes `Open`.
+//! * a bare `Pending` never undoes `Open`, and a bare stream `Open` never undoes `CancelQueued`.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -73,6 +74,57 @@ pub struct Applied {
     pub notices: Vec<Notice>,
 }
 
+/// Whether `incoming` is news about an order we already hold, or an old message arriving late.
+///
+/// * The filled amount never goes down.
+/// * A finished order never becomes unfinished. It still learns more: a bigger fill (a late
+///   message can carry one) and, from a read of the order itself rather than a stream message, the
+///   final fee, average price and value of the same ending, which a stream message may state
+///   before they are final.
+/// * `Open -> EditQueued -> Open` is a real life cycle (an edit settling), so that is never
+///   stale. A cancel can be refused, so `CancelQueued -> Open` is possible too, but a *stream*
+///   message that says nothing except `Open` after `CancelQueued` is far more likely to be an old
+///   one arriving late. The order is read again after every cancel, and that read is believed.
+fn is_stale(existing: &LiveOrder, incoming: &LiveOrder, source: Source) -> bool {
+    if incoming.filled_size < existing.filled_size {
+        return true;
+    }
+    if existing.status.is_terminal() {
+        if !incoming.status.is_terminal() {
+            return true;
+        }
+        if incoming.filled_size > existing.filled_size {
+            return false;
+        }
+        let same_ending = incoming.status == existing.status;
+        let learns = incoming.fees >= existing.fees
+            && (incoming.fees != existing.fees
+                || incoming.average_price != existing.average_price
+                || incoming.filled_value != existing.filled_value);
+        return !(source != Source::Stream && same_ending && learns);
+    }
+    if incoming.filled_size == existing.filled_size
+        && incoming.status == OrderStatus::Pending
+        && matches!(
+            existing.status,
+            OrderStatus::Open | OrderStatus::EditQueued | OrderStatus::CancelQueued
+        )
+    {
+        return true;
+    }
+    if source == Source::Stream
+        && existing.status == OrderStatus::CancelQueued
+        && incoming.status.rank() < existing.status.rank()
+    {
+        let mut same_but_status = incoming.clone();
+        same_but_status.status = existing.status;
+        same_but_status.updated_ms = existing.updated_ms;
+        same_but_status.reason.clone_from(&existing.reason);
+        return same_but_status == *existing;
+    }
+    false
+}
+
 /// Finished orders kept for display after they leave the working set.
 const KEEP_FINISHED: usize = 50;
 const KEEP_FILLS: usize = 1000;
@@ -100,18 +152,10 @@ impl Book {
     /// Applies one order update. Idempotent; a stale update changes nothing.
     pub fn apply_order(&mut self, incoming: LiveOrder, source: Source) -> Applied {
         let previous = self.orders.get(&incoming.id).cloned();
-        if let Some(existing) = &previous {
-            let stale = existing.status.is_terminal()
-                || incoming.filled_size < existing.filled_size
-                || (incoming.filled_size == existing.filled_size
-                    && incoming.status == OrderStatus::Pending
-                    && matches!(
-                        existing.status,
-                        OrderStatus::Open | OrderStatus::EditQueued | OrderStatus::CancelQueued
-                    ));
-            if stale || *existing == incoming {
-                return Applied::default();
-            }
+        if let Some(existing) = &previous
+            && (is_stale(existing, &incoming, source) || *existing == incoming)
+        {
+            return Applied::default();
         }
 
         let mut notices = Vec::new();
@@ -414,6 +458,121 @@ mod tests {
         assert!(
             book.apply_order(order("a", OrderStatus::Open, "0"), Source::Stream)
                 .changed
+        );
+    }
+
+    fn with_fees(mut o: LiveOrder, fees: &str, average: &str) -> LiveOrder {
+        o.fees = d(fees);
+        o.average_price = Some(d(average));
+        o.filled_value = d(average) * o.filled_size;
+        o
+    }
+
+    #[test]
+    fn a_finished_order_learns_its_final_fee_and_price_from_a_read_but_not_from_the_stream() {
+        let mut book = Book::new();
+        book.apply_order(order("a", OrderStatus::Open, "0"), Source::Stream);
+        // The stream says filled, with the fee as it knew it then.
+        let first = book.apply_order(
+            with_fees(order("a", OrderStatus::Filled, "1"), "0.10", "100"),
+            Source::Stream,
+        );
+        assert_eq!(kinds(&first), [NoticeKind::Filled]);
+        // Another stream message for the same ending changes nothing.
+        assert!(
+            !book
+                .apply_order(
+                    with_fees(order("a", OrderStatus::Filled, "1"), "0.20", "101"),
+                    Source::Stream
+                )
+                .changed
+        );
+        // The order read itself has the final figures: they replace the early ones, quietly.
+        let read = book.apply_order(
+            with_fees(order("a", OrderStatus::Filled, "1"), "0.25", "100.5"),
+            Source::Refetch,
+        );
+        assert!(read.changed);
+        assert!(read.notices.is_empty(), "the fill was told once");
+        let held = book.get(&OrderId::new("a")).unwrap();
+        assert_eq!(held.fees, d("0.25"));
+        assert_eq!(held.average_price, Some(d("100.5")));
+        // A read with a *smaller* fee is the older picture.
+        assert!(
+            !book
+                .apply_order(
+                    with_fees(order("a", OrderStatus::Filled, "1"), "0.10", "100"),
+                    Source::Refetch
+                )
+                .changed
+        );
+    }
+
+    #[test]
+    fn a_finished_order_takes_a_bigger_fill_but_never_a_smaller_one_or_a_different_ending() {
+        let mut book = Book::new();
+        book.apply_order(order("a", OrderStatus::Open, "0"), Source::Stream);
+        book.apply_order(order("a", OrderStatus::Cancelled, "0.5"), Source::Stream);
+        // The cancel raced a fill: the order in fact filled completely.
+        assert!(
+            book.apply_order(order("a", OrderStatus::Filled, "1"), Source::Refetch)
+                .changed
+        );
+        assert_eq!(
+            book.get(&OrderId::new("a")).unwrap().status,
+            OrderStatus::Filled
+        );
+        // Late, older messages cannot undo it.
+        for late in [
+            order("a", OrderStatus::Cancelled, "0.5"),
+            order("a", OrderStatus::Cancelled, "1"),
+            order("a", OrderStatus::Open, "1"),
+        ] {
+            assert!(
+                !book.apply_order(late.clone(), Source::Refetch).changed,
+                "{late:?}"
+            );
+        }
+        assert_eq!(book.get(&OrderId::new("a")).unwrap().filled_size, d("1"));
+    }
+
+    #[test]
+    fn a_stream_message_that_only_lowers_the_status_is_old_but_a_read_is_believed() {
+        let mut book = Book::new();
+        book.apply_order(order("a", OrderStatus::Open, "0"), Source::Stream);
+        book.apply_order(order("a", OrderStatus::CancelQueued, "0"), Source::Stream);
+        // An "open" that was sent before the cancel arrives after it.
+        assert!(
+            !book
+                .apply_order(order("a", OrderStatus::Open, "0"), Source::Stream)
+                .changed
+        );
+        assert_eq!(
+            book.get(&OrderId::new("a")).unwrap().status,
+            OrderStatus::CancelQueued
+        );
+        // The order read after the request is the answer, even if the cancel was refused.
+        assert!(
+            book.apply_order(order("a", OrderStatus::Open, "0"), Source::Refetch)
+                .changed
+        );
+        assert_eq!(
+            book.get(&OrderId::new("a")).unwrap().status,
+            OrderStatus::Open
+        );
+    }
+
+    #[test]
+    fn an_edit_settling_is_news_from_the_stream_because_the_terms_changed() {
+        let mut book = Book::new();
+        book.apply_order(order("a", OrderStatus::Open, "0"), Source::Stream);
+        book.apply_order(order("a", OrderStatus::EditQueued, "0"), Source::Stream);
+        let mut settled = order("a", OrderStatus::Open, "0");
+        settled.limit_price = Some(d("101"));
+        assert!(book.apply_order(settled, Source::Stream).changed);
+        assert_eq!(
+            book.get(&OrderId::new("a")).unwrap().limit_price,
+            Some(d("101"))
         );
     }
 
