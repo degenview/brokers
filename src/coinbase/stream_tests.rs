@@ -299,8 +299,17 @@ fn a_server_error_that_echoes_the_subscription_is_scrubbed_and_short() {
             _ => None,
         })
         .unwrap();
-    for secret in [token.as_str(), KEY_NAME, key_line.as_str()] {
-        assert!(!reason.contains(secret), "leaked {secret}: {reason}");
+    // A failure names which value leaked and shows the reason with every secret blanked out: the
+    // test must not print the very values it is checking for.
+    let secrets = [token.as_str(), KEY_NAME, key_line.as_str()];
+    let shown = secrets.iter().fold(reason.clone(), |text, secret| {
+        text.replace(secret, "<secret>")
+    });
+    for (index, secret) in secrets.iter().enumerate() {
+        assert!(
+            !reason.contains(secret),
+            "secret #{index} leaked into the reason: {shown}"
+        );
     }
     assert!(!reason.contains("eyJ"), "{reason}");
     assert!(!reason.contains('\n'));

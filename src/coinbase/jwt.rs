@@ -394,16 +394,20 @@ mod tests {
     #[test]
     fn bad_keys_are_refused_without_echoing_them() {
         let secret_looking = "SUPERSECRETVALUE-not-a-key";
-        for bad in [
+        for (case, bad) in [
             "",
             secret_looking,
             "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n",
             "-----BEGIN EC PRIVATE KEY-----\nAAAA",
             "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
             "AAAA",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let error = JwtSigner::new("k", bad, clock()).unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Auth, "{bad:?}");
+            // The case number, not the value: a key-shaped string must not reach a test log.
+            assert_eq!(error.kind, ErrorKind::Auth, "bad key case #{case}");
             assert!(!error.to_string().contains(secret_looking));
             assert!(!error.detail.contains(secret_looking));
         }
