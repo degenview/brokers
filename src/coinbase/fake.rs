@@ -66,6 +66,8 @@ pub struct State {
     next_id: u32,
     /// Create the order, then drop the connection without replying.
     pub drop_reply_after_create: bool,
+    /// Create the order, then answer success with a body that is cut off.
+    pub garble_create_reply: bool,
     /// Refuse the next create with this `new_order_failure_reason`.
     pub refuse_create_with: Option<String>,
     /// Answer the next N requests with 429.
@@ -292,6 +294,9 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
             if state.drop_reply_after_create {
                 state.drop_reply_after_create = false;
                 Reply::Drop
+            } else if state.garble_create_reply {
+                state.garble_create_reply = false;
+                Reply::json(200, r#"{"success":true,"success_resp"#)
             } else {
                 Reply::json(200, reply.to_string())
             }

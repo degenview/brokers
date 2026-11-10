@@ -281,7 +281,9 @@ fn retrying_looks_first_and_reuses_the_same_client_id() {
         .unresolved(BrokerId::new("coinbase"))
         .unwrap()
         .remove(0);
-    let placed = submit::retry(connection.as_ref(), &journal, &RULES, &entry, NOW + 3_000).unwrap();
+    let placed = submit::retry(connection.as_ref(), &journal, &RULES, &entry, NOW + 3_000)
+        .unwrap()
+        .placed;
     assert_eq!(placed.product.as_str(), "BTC-USD");
     assert_eq!(fake.posts_to_create(), 1, "found, not doubled");
 
@@ -579,4 +581,75 @@ fn market_orders_by_quote_and_stop_limits_serialise_as_documented() {
         sent["market_market_ioc"].get("base_size").is_none(),
         "only one size basis is sent"
     );
+}
+
+#[test]
+fn an_answer_that_cannot_be_read_never_says_not_sent_and_keeps_the_record() {
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    let journal = MemoryJournal::new();
+    fake.with_state(|s| s.garble_create_reply = true);
+    let client_id = new_client_order_id(&RULES).unwrap();
+
+    let error =
+        submit::submit(connection.as_ref(), &journal, &limit_buy(), &client_id, NOW).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::OutcomeUnknown, "{error:?}");
+    assert_eq!(fake.with_state(|s| s.orders.len()), 1, "it was created");
+    assert_eq!(
+        journal.unresolved(BrokerId::new("coinbase")).unwrap().len(),
+        1,
+        "and is still recorded, so it can be found"
+    );
+    let entry = journal
+        .unresolved(BrokerId::new("coinbase"))
+        .unwrap()
+        .remove(0);
+    let found = submit::reconcile(connection.as_ref(), &journal, &entry, NOW + 5_000).unwrap();
+    assert!(matches!(found, Reconciled::Placed(_)));
+    assert_eq!(fake.posts_to_create(), 1);
+}
+
+#[test]
+fn an_accepted_order_is_placed_even_if_the_journal_cannot_be_updated() {
+    use std::sync::atomic::Ordering;
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    let journal = MemoryJournal::new();
+    journal.fail_to_resolve.store(true, Ordering::SeqCst);
+    let client_id = new_client_order_id(&RULES).unwrap();
+
+    let submitted =
+        submit::submit(connection.as_ref(), &journal, &limit_buy(), &client_id, NOW).unwrap();
+    assert_eq!(submitted.placed.order_id.as_str(), "order-1");
+    assert!(
+        submitted.unsettled.is_some(),
+        "the failure is reported alongside, not instead"
+    );
+    assert_eq!(
+        journal.unresolved(BrokerId::new("coinbase")).unwrap().len(),
+        1,
+        "the entry stays until it can be closed"
+    );
+
+    // Found later, with the journal still broken: the order is returned, flagged.
+    let entry = journal
+        .unresolved(BrokerId::new("coinbase"))
+        .unwrap()
+        .remove(0);
+    let found = submit::reconcile(connection.as_ref(), &journal, &entry, NOW + 5_000).unwrap();
+    assert!(
+        matches!(found, Reconciled::PlacedUnsettled(_, _)),
+        "{found:?}"
+    );
+    // And closed once the journal works again, with nothing sent.
+    journal.fail_to_resolve.store(false, Ordering::SeqCst);
+    let found = submit::reconcile(connection.as_ref(), &journal, &entry, NOW + 6_000).unwrap();
+    assert!(matches!(found, Reconciled::Placed(_)));
+    assert!(
+        journal
+            .unresolved(BrokerId::new("coinbase"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fake.posts_to_create(), 1);
 }

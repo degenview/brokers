@@ -198,6 +198,22 @@ pub fn run_all(fresh: impl Fn() -> Box<dyn Exchange>) {
             "a rate limit does not resend an order",
             a_rate_limit_does_not_resend_an_order,
         ),
+        (
+            "an unreadable journal blocks new orders but not cancels",
+            an_unreadable_journal_blocks_new_orders_but_not_cancels,
+        ),
+        (
+            "an unreadable journal at start is reported, not ignored",
+            an_unreadable_journal_at_start_is_reported_not_ignored,
+        ),
+        (
+            "an accepted order stays visible when its record cannot be closed",
+            an_accepted_order_stays_visible_when_its_record_cannot_be_closed,
+        ),
+        (
+            "a failed lookup keeps the unconfirmed order",
+            a_failed_lookup_keeps_the_unconfirmed_order,
+        ),
     ];
     for (name, scenario) in scenarios {
         let exchange = fresh();
@@ -479,5 +495,126 @@ fn a_rate_limit_does_not_resend_an_order(exchange: &dyn Exchange) {
         // A background read took the one rate-limited answer; the order went through once.
         Ok(_) => assert_eq!(exchange.order_posts(), 1),
     }
+    f.runtime.stop();
+}
+
+fn an_unreadable_journal_blocks_new_orders_but_not_cancels(exchange: &dyn Exchange) {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::start(exchange);
+    f.wait_live();
+    let id = f.place();
+    let posts = exchange.order_posts();
+
+    // The record of unconfirmed orders becomes unreadable: orders that may be live could be missing
+    // from it, so nothing new is sent, and the user is told why.
+    f.journal.fail_to_read.store(true, Ordering::SeqCst);
+    wait_until("the unreadable record to be noticed", || {
+        f.snapshot().journal_error.is_some()
+    });
+    assert!(!f.snapshot().can_send_orders());
+    let error = f.runtime.submit(exchange.draft()).wait().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Invalid);
+    assert!(error.to_string().contains("No order was sent"), "{error}");
+    assert_eq!(
+        exchange.order_posts(),
+        posts,
+        "nothing reached the exchange"
+    );
+
+    // Cancelling is still possible: the user must be able to get out.
+    let results = f
+        .runtime
+        .cancel(vec![OrderId::new(&id)])
+        .wait()
+        .expect("the cancel is sent");
+    assert!(matches!(
+        results[0].outcome,
+        crate::model::orders::CancelOutcome::Requested
+    ));
+
+    // Readable again: the block lifts by itself.
+    f.journal.fail_to_read.store(false, Ordering::SeqCst);
+    wait_until("the record to be read again", || {
+        f.snapshot().journal_error.is_none()
+    });
+    assert!(f.snapshot().can_send_orders());
+    f.runtime.stop();
+}
+
+fn an_unreadable_journal_at_start_is_reported_not_ignored(exchange: &dyn Exchange) {
+    use std::sync::atomic::Ordering;
+    let journal = Arc::new(MemoryJournal::new());
+    journal.fail_to_read.store(true, Ordering::SeqCst);
+    let f = Fixture::start_with(exchange, journal);
+    f.wait_live();
+    assert!(
+        f.snapshot().journal_error.is_some(),
+        "an unreadable record is not an empty one"
+    );
+    assert!(f.runtime.submit(exchange.draft()).wait().is_err());
+    assert_eq!(exchange.order_posts(), 0);
+    f.runtime.stop();
+}
+
+fn an_accepted_order_stays_visible_when_its_record_cannot_be_closed(exchange: &dyn Exchange) {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::start(exchange);
+    f.wait_live();
+    f.journal.fail_to_resolve.store(true, Ordering::SeqCst);
+    let placed = f
+        .runtime
+        .submit(exchange.draft())
+        .wait()
+        .expect("an accepted order is a placed order, whatever the journal says");
+    f.wait_order(&placed.order_id.0, "the order to be shown", |_| true);
+    assert_eq!(
+        f.journal.unresolved(f.broker_id()).unwrap().len(),
+        1,
+        "the record stays until it can be closed"
+    );
+    assert!(
+        f.snapshot()
+            .last_error
+            .as_deref()
+            .is_some_and(|text| text.contains("record")),
+        "the user is told: {:?}",
+        f.snapshot().last_error
+    );
+
+    // Closed by itself once the journal works, with nothing sent again.
+    f.journal.fail_to_resolve.store(false, Ordering::SeqCst);
+    wait_until("the record to be closed", || {
+        f.journal.unresolved(f.broker_id()).unwrap().is_empty()
+    });
+    assert_eq!(exchange.order_posts(), 1);
+    assert_eq!(f.snapshot().working_orders().count(), 1);
+    f.runtime.stop();
+}
+
+fn a_failed_lookup_keeps_the_unconfirmed_order(exchange: &dyn Exchange) {
+    use crate::model::pending::{PendingJournal, PendingSubmission};
+    let journal = Arc::new(MemoryJournal::new());
+    let client_id = crate::model::types::ClientOrderId::new("sent-before-the-restart");
+    let broker = exchange.broker().descriptor().id;
+    journal
+        .record(&PendingSubmission {
+            broker,
+            client_id: client_id.clone(),
+            draft: exchange.draft(),
+            created_ms: 1_794_225_600_000,
+        })
+        .unwrap();
+    let f = Fixture::start_with(exchange, journal);
+    f.wait_live();
+    assert_eq!(f.snapshot().pending.len(), 1, "shown as unconfirmed");
+
+    // The lookup fails (the key stops working): the order may still be live, so it stays listed
+    // and recorded. It is not "gone" just because one lookup did not answer.
+    exchange.revoke_key();
+    let error = f.runtime.retry(client_id.clone()).wait().unwrap_err();
+    assert_ne!(error.kind, ErrorKind::NotFound, "{error:?}");
+    assert_eq!(f.snapshot().pending.len(), 1);
+    assert_eq!(f.journal.unresolved(broker).unwrap().len(), 1);
+    assert_eq!(exchange.order_posts(), 0, "a failed lookup sends nothing");
     f.runtime.stop();
 }

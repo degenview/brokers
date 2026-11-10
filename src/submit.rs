@@ -10,11 +10,15 @@
 //!    is believed only after the broker has had [`SETTLE_MS`] to list it.
 //! 4. Sending again is an explicit act ([`retry`]), uses the **same** client order id, and looks
 //!    first.
+//! 5. "Not sent" is said only when nothing left the machine: the order could not be recorded, or
+//!    the broker clearly refused it. Once the broker has accepted an order, failing to *update the
+//!    journal* never takes that back: the order is returned as placed, with the failure alongside
+//!    ([`Submitted::unsettled`]), and the entry stays until a lookup can settle it.
 
 use crate::adapter::{ClientIdRules, Connection};
 use crate::error::{BrokerError, ErrorKind, Result};
 use crate::model::orders::PlacedOrder;
-use crate::model::pending::{PendingJournal, PendingSubmission, SubmissionOutcome};
+use crate::model::pending::{JournalError, PendingJournal, PendingSubmission, SubmissionOutcome};
 use crate::model::types::{ClientOrderId, LiveOrder, OrderDraft};
 
 /// How long a broker is given to list an order it accepted before "not listed" is believed.
@@ -30,11 +34,22 @@ fn journal_failure(error: impl std::fmt::Display) -> BrokerError {
     .with_detail(error.to_string())
 }
 
+/// An order the broker accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Submitted {
+    pub placed: PlacedOrder,
+    /// The journal entry could not be marked settled. The order is live all the same; the entry
+    /// stays, and a later lookup settles it.
+    pub unsettled: Option<JournalError>,
+}
+
 /// What a reconciliation found.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Reconciled {
     /// The broker has the order.
     Placed(Box<LiveOrder>),
+    /// The broker has the order, and the journal entry could not be marked settled.
+    PlacedUnsettled(Box<LiveOrder>, JournalError),
     /// The broker does not list it and has had long enough: it was not placed.
     NotPlaced,
     /// The broker does not list it yet. Ask again shortly; do not resend.
@@ -56,7 +71,7 @@ pub fn submit(
     draft: &OrderDraft,
     client_id: &ClientOrderId,
     now_ms: i64,
-) -> Result<PlacedOrder> {
+) -> Result<Submitted> {
     let entry = PendingSubmission {
         broker: connection.broker(),
         client_id: client_id.clone(),
@@ -71,19 +86,22 @@ fn send(
     connection: &dyn Connection,
     journal: &dyn PendingJournal,
     entry: &PendingSubmission,
-) -> Result<PlacedOrder> {
+) -> Result<Submitted> {
     match connection.place(&entry.draft, &entry.client_id) {
         Ok(placed) => {
-            journal
+            // The broker has the order. Whatever happens to the journal, it is live.
+            let unsettled = journal
                 .resolve(
                     entry.broker,
                     &entry.client_id,
                     &SubmissionOutcome::Placed(placed.order_id.clone()),
                 )
-                .map_err(journal_failure)?;
-            Ok(placed)
+                .err();
+            Ok(Submitted { placed, unsettled })
         }
-        // The broker said no, clearly: nothing is live.
+        // The broker said no, clearly, or nothing was sent: nothing is live. (`Invalid` from a
+        // write means no request left: the HTTP layer reports every unreadable answer as
+        // `OutcomeUnknown`.)
         Err(error)
             if matches!(
                 error.kind,
@@ -119,14 +137,15 @@ pub fn reconcile(
     let since = entry.created_ms.saturating_sub(LOOKBACK_MS);
     match connection.find_by_client_id(&entry.client_id, since)? {
         Some(order) => {
-            journal
-                .resolve(
-                    entry.broker,
-                    &entry.client_id,
-                    &SubmissionOutcome::Placed(order.id.clone()),
-                )
-                .map_err(journal_failure)?;
-            Ok(Reconciled::Placed(Box::new(order)))
+            // Found: it is live whether or not the journal can be told.
+            match journal.resolve(
+                entry.broker,
+                &entry.client_id,
+                &SubmissionOutcome::Placed(order.id.clone()),
+            ) {
+                Ok(()) => Ok(Reconciled::Placed(Box::new(order))),
+                Err(error) => Ok(Reconciled::PlacedUnsettled(Box::new(order), error)),
+            }
         }
         None if now_ms.saturating_sub(entry.created_ms) >= SETTLE_MS => {
             journal
@@ -135,7 +154,14 @@ pub fn reconcile(
                     &entry.client_id,
                     &SubmissionOutcome::NotPlaced,
                 )
-                .map_err(journal_failure)?;
+                .map_err(|error| {
+                    // The broker does not have it; the entry stays and is looked at again.
+                    BrokerError::new(
+                        ErrorKind::Transient,
+                        "The record of this order could not be updated. It will be checked again.",
+                    )
+                    .with_detail(error.to_string())
+                })?;
             Ok(Reconciled::NotPlaced)
         }
         None => Ok(Reconciled::NotListedYet),
@@ -150,9 +176,20 @@ pub fn retry(
     rules: &ClientIdRules,
     entry: &PendingSubmission,
     now_ms: i64,
-) -> Result<PlacedOrder> {
+) -> Result<Submitted> {
     match reconcile(connection, journal, entry, now_ms)? {
-        Reconciled::Placed(order) => return Ok(placed_from(&order)),
+        Reconciled::Placed(order) => {
+            return Ok(Submitted {
+                placed: placed_from(&order),
+                unsettled: None,
+            });
+        }
+        Reconciled::PlacedUnsettled(order, error) => {
+            return Ok(Submitted {
+                placed: placed_from(&order),
+                unsettled: Some(error),
+            });
+        }
         Reconciled::NotListedYet if !rules.idempotent => {
             return Err(BrokerError::new(
                 ErrorKind::OutcomeUnknown,
