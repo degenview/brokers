@@ -151,6 +151,10 @@ pub struct BrokerSnapshot {
     pub fees: Option<FeeSummary>,
     pub last_sync_ms: Option<i64>,
     pub last_error: Option<String>,
+    /// The record of orders sent and not yet confirmed cannot be read. Orders that may be live are
+    /// then invisible, so **no new order is accepted** until it can be read again; reading,
+    /// cancelling and editing keep working.
+    pub journal_error: Option<BrokerError>,
 }
 
 impl BrokerSnapshot {
@@ -170,6 +174,7 @@ impl BrokerSnapshot {
             fees: None,
             last_sync_ms: None,
             last_error: None,
+            journal_error: None,
         }
     }
 
@@ -185,9 +190,15 @@ impl BrokerSnapshot {
         self.orders.iter().filter(|v| v.order.status.is_working())
     }
 
-    /// Whether a new order may be sent now.
+    /// Whether the broker is connected and in sync.
     pub fn is_live(&self) -> bool {
         self.status == Status::Live
+    }
+
+    /// Whether a new order may be sent now: connected, in sync, and the record of unconfirmed
+    /// orders readable.
+    pub fn can_send_orders(&self) -> bool {
+        self.is_live() && self.journal_error.is_none()
     }
 }
 
@@ -374,6 +385,43 @@ impl Drop for BrokerRuntime {
     }
 }
 
+fn unknown_view(entry: PendingSubmission) -> PendingView {
+    PendingView {
+        client_id: entry.client_id,
+        draft: entry.draft,
+        created_ms: entry.created_ms,
+        state: PendingState::Unknown,
+    }
+}
+
+fn journal_unreadable(error: &crate::model::pending::JournalError) -> BrokerError {
+    BrokerError::new(
+        ErrorKind::Invalid,
+        "The record of orders waiting for confirmation cannot be read. Orders that may be live \
+         could be missing from this list, so new orders are blocked until it can be read again. \
+         Cancelling and editing still work.",
+    )
+    .with_detail(error.to_string())
+}
+
+fn journal_blocks_orders(error: &BrokerError) -> BrokerError {
+    BrokerError::new(
+        ErrorKind::Invalid,
+        "No order was sent: the record of orders waiting for confirmation cannot be read, and an \
+         order that may be live could be missing from it.",
+    )
+    .with_detail(error.detail.clone())
+}
+
+/// What the user is told when an order is live but its record could not be closed.
+fn unsettled_record(error: &crate::model::pending::JournalError) -> BrokerError {
+    BrokerError::new(
+        ErrorKind::Transient,
+        "The order was placed, but its record could not be updated. It will be checked again.",
+    )
+    .with_detail(error.to_string())
+}
+
 // ---- The worker ----------------------------------------------------------------------------------
 
 /// Orders to read again, with when.
@@ -397,6 +445,8 @@ struct Worker {
     catalogue: HashMap<ProductId, ProductSpec>,
     catalogue_ms: Option<i64>,
     pending: BTreeMap<String, PendingView>,
+    /// Why the journal of unconfirmed orders cannot be read, while it cannot.
+    journal_error: Option<BrokerError>,
     refetch: Vec<Refetch>,
 
     needs_resync: bool,
@@ -424,18 +474,15 @@ impl Worker {
         let now = config.env.clock.now_ms();
         let id = broker.descriptor().id;
         let mut pending = BTreeMap::new();
-        if let Ok(entries) = config.journal.unresolved(id) {
-            for entry in entries {
-                pending.insert(
-                    entry.client_id.0.clone(),
-                    PendingView {
-                        client_id: entry.client_id,
-                        draft: entry.draft,
-                        created_ms: entry.created_ms,
-                        state: PendingState::Unknown,
-                    },
-                );
+        let mut journal_error = None;
+        match config.journal.unresolved(id) {
+            Ok(entries) => {
+                for entry in entries {
+                    pending.insert(entry.client_id.0.clone(), unknown_view(entry));
+                }
             }
+            // Not "nothing pending": orders that may be live are in there somewhere.
+            Err(error) => journal_error = Some(journal_unreadable(&error)),
         }
         Self {
             broker,
@@ -446,10 +493,15 @@ impl Worker {
             connection: None,
             stream: None,
             book: Book::new(),
-            snapshot: BrokerSnapshot::empty(id),
+            snapshot: {
+                let mut snapshot = BrokerSnapshot::empty(id);
+                snapshot.journal_error.clone_from(&journal_error);
+                snapshot
+            },
             catalogue: HashMap::new(),
             catalogue_ms: None,
             pending,
+            journal_error,
             refetch: Vec::new(),
             needs_resync: false,
             stream_was_down: false,
@@ -575,7 +627,9 @@ impl Worker {
             self.dirty = true;
         }
         let reconcile = i64::try_from(self.config.reconcile_every.as_millis()).unwrap_or(i64::MAX);
-        if !self.pending.is_empty() && now - self.last_reconcile_ms >= reconcile {
+        // Also with nothing pending: it is how an unreadable record is noticed, and how it is
+        // noticed to have recovered.
+        if now - self.last_reconcile_ms >= reconcile {
             self.last_reconcile_ms = now;
             self.reconcile_pending();
         }
@@ -824,9 +878,25 @@ impl Worker {
             return;
         };
         let id = self.broker.descriptor().id;
-        let Ok(entries) = self.config.journal.unresolved(id) else {
-            return;
+        let entries = match self.config.journal.unresolved(id) {
+            Ok(entries) => {
+                self.set_journal_error(None);
+                entries
+            }
+            Err(error) => {
+                self.set_journal_error(Some(journal_unreadable(&error)));
+                return;
+            }
         };
+        // Entries the journal holds that nothing on screen shows (it was unreadable at the start,
+        // or an answer was lost) are shown again, as unconfirmed.
+        for entry in &entries {
+            if !self.pending.contains_key(&entry.client_id.0) {
+                self.pending
+                    .insert(entry.client_id.0.clone(), unknown_view(entry.clone()));
+                self.dirty = true;
+            }
+        }
         let now = self.config.env.clock.now_ms();
         for entry in entries {
             match submit::reconcile(
@@ -842,6 +912,15 @@ impl Worker {
                     self.balances_due_ms = Some(now);
                     self.dirty = true;
                 }
+                // The order is live and shown; only the record could not be closed, and it is
+                // looked at again on the next round.
+                Ok(submit::Reconciled::PlacedUnsettled(order, error)) => {
+                    self.pending.remove(&entry.client_id.0);
+                    self.apply_order(*order, Source::Refetch);
+                    self.fills_due_ms = Some(now);
+                    self.balances_due_ms = Some(now);
+                    self.note_error(&unsettled_record(&error));
+                }
                 Ok(submit::Reconciled::NotPlaced) => {
                     self.pending.remove(&entry.client_id.0);
                     self.dirty = true;
@@ -849,6 +928,35 @@ impl Worker {
                 Ok(submit::Reconciled::NotListedYet) => {}
                 Err(error) => self.note_error(&error),
             }
+        }
+    }
+
+    fn set_journal_error(&mut self, error: Option<BrokerError>) {
+        if self.journal_error != error {
+            self.snapshot.journal_error.clone_from(&error);
+            self.journal_error = error;
+            self.dirty = true;
+        }
+    }
+
+    /// After a submission or a retry ended in an error: the item leaves the screen only if the
+    /// journal no longer holds it. If the journal still has it, or cannot be read, the order may
+    /// be live and it stays, as unconfirmed.
+    fn settle_view(&mut self, client_id: &ClientOrderId) {
+        let id = self.broker.descriptor().id;
+        let held = match self.config.journal.unresolved(id) {
+            Ok(entries) => entries.iter().any(|entry| &entry.client_id == client_id),
+            Err(error) => {
+                self.set_journal_error(Some(journal_unreadable(&error)));
+                true
+            }
+        };
+        if held {
+            if let Some(view) = self.pending.get_mut(&client_id.0) {
+                view.state = PendingState::Unknown;
+            }
+        } else {
+            self.pending.remove(&client_id.0);
         }
     }
 
@@ -1015,6 +1123,9 @@ impl Worker {
         if !self.snapshot.is_live() {
             return Err(Self::not_connected());
         }
+        if let Some(error) = &self.journal_error {
+            return Err(journal_blocks_orders(error));
+        }
         let spec = self.product(&draft.product)?;
         let (caps, rules) = match self.connection.clone() {
             Some(connection) => (
@@ -1048,8 +1159,9 @@ impl Worker {
             &client_id,
             now,
         );
-        match &result {
-            Ok(placed) => {
+        let result = match result {
+            Ok(submitted) => {
+                let placed = submitted.placed;
                 self.pending.remove(&client_id.0);
                 // Show the order at once, as the broker has it, rather than waiting for the stream.
                 self.fetch_order(&placed.order_id);
@@ -1058,17 +1170,25 @@ impl Worker {
                 }
                 self.fills_due_ms = Some(now + 500);
                 self.balances_due_ms = Some(now + 500);
-            }
-            Err(error) if error.kind == ErrorKind::OutcomeUnknown => {
-                if let Some(view) = self.pending.get_mut(&client_id.0) {
-                    view.state = PendingState::Unknown;
+                if let Some(error) = &submitted.unsettled {
+                    // Live, and the user is told so; the record is closed on a later round.
+                    self.note_error(&unsettled_record(error));
+                    self.last_reconcile_ms = 0;
                 }
-                self.last_reconcile_ms = 0;
+                Ok(placed)
             }
-            Err(_) => {
-                self.pending.remove(&client_id.0);
+            Err(error) => {
+                if error.kind == ErrorKind::OutcomeUnknown {
+                    if let Some(view) = self.pending.get_mut(&client_id.0) {
+                        view.state = PendingState::Unknown;
+                    }
+                    self.last_reconcile_ms = 0;
+                } else {
+                    self.settle_view(&client_id);
+                }
+                Err(error)
             }
-        }
+        };
         self.dirty = true;
         result
     }
@@ -1079,7 +1199,11 @@ impl Worker {
             .config
             .journal
             .unresolved(id)
-            .map_err(|e| BrokerError::invalid(e.to_string()))?
+            .map_err(|error| {
+                let error = journal_unreadable(&error);
+                self.set_journal_error(Some(error.clone()));
+                journal_blocks_orders(&error)
+            })?
             .into_iter()
             .find(|entry| &entry.client_id == client_id)
             .ok_or_else(|| {
@@ -1095,25 +1219,48 @@ impl Worker {
             &entry,
             now,
         );
-        match &result {
-            Ok(placed) => {
+        let result = match result {
+            Ok(submitted) => {
+                let placed = submitted.placed;
                 self.pending.remove(&client_id.0);
                 self.fetch_order(&placed.order_id);
                 if self.book.get(&placed.order_id).is_none() {
                     self.schedule_refetch(placed.order_id.clone(), 1_000);
                 }
+                if let Some(error) = &submitted.unsettled {
+                    self.note_error(&unsettled_record(error));
+                    self.last_reconcile_ms = 0;
+                }
+                Ok(placed)
             }
-            Err(error) if error.kind == ErrorKind::OutcomeUnknown => {}
-            Err(_) => {
-                self.pending.remove(&client_id.0);
+            // A lookup that failed, a refusal, anything: the item leaves only if the journal has
+            // let go of it.
+            Err(error) => {
+                if error.kind != ErrorKind::OutcomeUnknown {
+                    self.settle_view(client_id);
+                }
+                Err(error)
             }
-        }
+        };
         self.dirty = true;
         result
     }
 
     fn cancel(&mut self, ids: &[OrderId]) -> Result<Vec<CancelResult>> {
-        let results = self.with_connection(|c| c.cancel(ids))?;
+        let results = match self.with_connection(|c| c.cancel(ids)) {
+            Ok(results) => results,
+            Err(error) => {
+                // The request may have been carried out even though no answer came back: read
+                // every order again to see.
+                if error.kind == ErrorKind::OutcomeUnknown {
+                    for id in ids {
+                        self.schedule_refetch(id.clone(), 0);
+                    }
+                    self.dirty = true;
+                }
+                return Err(error);
+            }
+        };
         let now = self.now();
         for result in &results {
             match &result.outcome {
@@ -1125,7 +1272,8 @@ impl Worker {
                 // The broker knows better than we do: read how it ended.
                 CancelOutcome::AlreadyFilled
                 | CancelOutcome::NotFound
-                | CancelOutcome::BeingReplaced => {
+                | CancelOutcome::BeingReplaced
+                | CancelOutcome::Unknown(_) => {
                     self.schedule_refetch(result.order_id.clone(), 0);
                 }
                 CancelOutcome::Rejected(_) => {}

@@ -202,8 +202,10 @@ impl HttpClient {
     }
 
     /// A signed POST with a JSON body that **changes state**. Never retried. A failure to complete
-    /// the exchange, or a reply that cannot be read, is [`ErrorKind::OutcomeUnknown`]: the broker
-    /// may have acted.
+    /// the exchange, a reply that cannot be read, a redirect or any status that is not a clear
+    /// refusal is [`ErrorKind::OutcomeUnknown`]: the broker may have acted. Only 400, 401, 403, 409
+    /// and 422 (and 404/429, which are not treated as proof either way) say anything else, so an
+    /// [`ErrorKind::Invalid`] from a write means that no request left the machine.
     pub fn post(&self, path: &str, body: &Value) -> Result<Value> {
         self.once("POST", path, &[], Some(body), true)
     }
@@ -264,11 +266,22 @@ impl HttpClient {
 
         if (200..300).contains(&status) {
             return serde_json::from_str(&text).map_err(|_| {
-                BrokerError::new(
-                    ErrorKind::Invalid,
-                    "The broker sent a reply that could not be read.",
-                )
-                .with_detail(self.detail(method, path, status, "body is not JSON"))
+                let detail = self.detail(method, path, status, "body is not JSON");
+                if write {
+                    // The broker answered success and we cannot read what it said: it may well
+                    // have acted. Never "not sent".
+                    BrokerError::new(
+                        ErrorKind::OutcomeUnknown,
+                        "The broker answered, but the reply could not be read. The order may have been placed.",
+                    )
+                    .with_detail(detail)
+                } else {
+                    BrokerError::new(
+                        ErrorKind::Invalid,
+                        "The broker sent a reply that could not be read.",
+                    )
+                    .with_detail(detail)
+                }
             });
         }
         Err(self.status_error(method, path, status, retry_after, &text, write))
@@ -328,6 +341,12 @@ impl HttpClient {
                 ErrorKind::RateLimited { retry_after_ms },
                 "The broker is rate limiting requests. Wait a moment.",
             ),
+            // A write that was answered with a redirect reached the broker; refusing to follow it
+            // does not say what the broker did first.
+            300..=399 if write => BrokerError::new(
+                ErrorKind::OutcomeUnknown,
+                "The broker redirected the order, which is refused. It may or may not have been placed.",
+            ),
             300..=399 => BrokerError::new(
                 ErrorKind::Invalid,
                 "The broker redirected the request, which is refused.",
@@ -346,6 +365,10 @@ impl HttpClient {
             500..=599 => {
                 BrokerError::new(ErrorKind::Transient, "The broker had a problem. Try again.")
             }
+            _ if write => BrokerError::new(
+                ErrorKind::OutcomeUnknown,
+                "The broker sent an unexpected reply to the order. It may or may not have been placed.",
+            ),
             _ => BrokerError::new(ErrorKind::Invalid, "The broker sent an unexpected reply."),
         };
         let error = error.with_detail(detail);
@@ -562,6 +585,40 @@ mod tests {
             .post("/orders", &serde_json::json!({}))
             .unwrap_err();
         assert_eq!(error.kind, ErrorKind::Rejected, "a 4xx is a clear refusal");
+    }
+
+    #[test]
+    fn a_write_the_broker_answered_in_a_way_we_cannot_read_may_have_been_placed() {
+        // Success status, body cut off or not JSON.
+        for body in ["", "not json", r#"{"success":tr"#] {
+            let body = body.to_owned();
+            let server = MockServer::start(move |_| Reply::json(200, body.clone()));
+            let error = client(&server)
+                .post("/orders", &serde_json::json!({}))
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::OutcomeUnknown, "{error:?}");
+            assert_eq!(server.request_count(), 1);
+        }
+        // A redirect or a status nobody listed: the request was delivered.
+        for status in [302_u16, 307, 418, 402] {
+            let server = MockServer::start(move |_| {
+                Reply::json(status, "{}").with_header("Location", "http://127.0.0.1:1/elsewhere")
+            });
+            let error = client(&server)
+                .post("/orders", &serde_json::json!({}))
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::OutcomeUnknown, "HTTP {status}");
+            assert_eq!(server.request_count(), 1, "HTTP {status}");
+        }
+        // Reads keep their own answers: nothing was changed, so nothing is unknown.
+        let server = MockServer::start(|_| Reply::json(200, "not json"));
+        let error = client(&server).get("/x", &[]).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Invalid);
+        let server = MockServer::start(|_| Reply::json(200, "not json"));
+        let error = client(&server)
+            .post_read("/orders/preview", &serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Invalid);
     }
 
     #[test]

@@ -33,7 +33,7 @@ change: it draws from the broker's `Descriptor` and the neutral model.
 7. **Mock exchange.** A stateful fake (REST, and a WebSocket server if there is a stream) built from
    the broker's *published specification*, labelled constructed. Implement
    `testing::conformance::Exchange` over it and call `run_all` from a test: the adapter must pass
-   the same twelve scenarios as every other.
+   the same sixteen scenarios as every other.
 8. **Docs.** `docs/<broker>.md`: what was verified, what was inferred, what is not implemented, and
    what could not be tested against the live service.
 

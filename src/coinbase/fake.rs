@@ -66,10 +66,18 @@ pub struct State {
     next_id: u32,
     /// Create the order, then drop the connection without replying.
     pub drop_reply_after_create: bool,
+    /// Create the order, then answer success with a body that is cut off.
+    pub garble_create_reply: bool,
     /// Refuse the next create with this `new_order_failure_reason`.
     pub refuse_create_with: Option<String>,
     /// Answer the next N requests with 429.
     pub rate_limit_next: usize,
+    /// Answer every preview (order and edit) with a 422, as a broker that cannot preview would.
+    pub fail_preview: bool,
+    /// Answer the Nth (from 0) `batch_cancel` request with a 502.
+    pub fail_cancel_batch: Option<usize>,
+    /// How many `batch_cancel` requests were received.
+    pub cancel_batches_seen: usize,
     /// What `cancel` says for each order, instead of success.
     pub cancel_failure: Option<String>,
     /// What `edit` says instead of success.
@@ -234,6 +242,10 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
             200,
             r#"{"fee_tier":{"pricing_tier":"Advanced 1","maker_fee_rate":"0.004","taker_fee_rate":"0.006"}}"#,
         ),
+        ("POST", "/orders/preview" | "/orders/edit_preview") if state.fail_preview => Reply::json(
+            422,
+            r#"{"message":"preview is unavailable","code":"UNAVAILABLE"}"#,
+        ),
         ("POST", "/orders/preview") => {
             let body: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
             let size = body["order_configuration"]
@@ -292,11 +304,19 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
             if state.drop_reply_after_create {
                 state.drop_reply_after_create = false;
                 Reply::Drop
+            } else if state.garble_create_reply {
+                state.garble_create_reply = false;
+                Reply::json(200, r#"{"success":true,"success_resp"#)
             } else {
                 Reply::json(200, reply.to_string())
             }
         }
         ("POST", "/orders/batch_cancel") => {
+            let batch = state.cancel_batches_seen;
+            state.cancel_batches_seen += 1;
+            if state.fail_cancel_batch == Some(batch) {
+                return Reply::json(502, r#"{"message":"bad gateway"}"#);
+            }
             let body: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
             let ids: Vec<String> = body["order_ids"]
                 .as_array()
@@ -353,6 +373,15 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
         }
         ("GET", "/orders/historical/batch") => {
             let wanted = query_values(request, "order_status");
+            // Coinbase's own rule, met on the first real run: active statuses are asked for one
+            // at a time, never together or mixed with others.
+            const ACTIVE: [&str; 5] = ["OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED"];
+            if wanted.len() > 1 && wanted.iter().any(|status| ACTIVE.contains(status)) {
+                return Reply::json(
+                    400,
+                    r#"{"error":"INVALID_ARGUMENT","message":"Cannot pass multiple statuses when requesting active orders (OPEN, PENDING, QUEUED, EDIT_QUEUED, or CANCEL_QUEUED)","error_details":""}"#,
+                );
+            }
             let orders: Vec<Value> = state
                 .orders
                 .iter()

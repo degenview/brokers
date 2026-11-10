@@ -60,7 +60,8 @@ mod guard_tests {
                 sources(&path, out);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 let text = fs::read_to_string(&path).expect("read a source file");
-                out.push((path.display().to_string(), text));
+                // Forward slashes on every platform, so the comparisons below hold on Windows too.
+                out.push((path.display().to_string().replace('\\', "/"), text));
             }
         }
     }

@@ -133,41 +133,76 @@ impl CoinbaseConnection {
 
     pub(super) fn do_cancel(&self, orders: &[OrderId]) -> Result<Vec<CancelResult>> {
         let mut results = Vec::new();
-        for chunk in orders.chunks(CANCEL_BATCH) {
-            let ids: Vec<&str> = chunk.iter().map(OrderId::as_str).collect();
-            let value = self
-                .http
-                .post(&path("/orders/batch_cancel"), &json!({ "order_ids": ids }))?;
-            let response: CancelResponse = serde_json::from_value(value).map_err(|_| {
-                BrokerError::new(
-                    ErrorKind::OutcomeUnknown,
-                    "Coinbase's reply to the cancel could not be read. Check the order's status.",
-                )
-            })?;
-            for id in chunk {
-                let entry = response.results.iter().find(|r| r.order_id == id.as_str());
-                let outcome = match entry {
-                    None => CancelOutcome::Rejected(
-                        "Coinbase did not say what happened to this cancel.".to_owned(),
-                    ),
-                    Some(entry) if entry.success => CancelOutcome::Requested,
-                    Some(entry) => match entry.failure_reason.as_str() {
-                        "ORDER_IS_FULLY_FILLED" => CancelOutcome::AlreadyFilled,
-                        "UNKNOWN_CANCEL_ORDER" => CancelOutcome::NotFound,
-                        "ORDER_IS_BEING_REPLACED" => CancelOutcome::BeingReplaced,
-                        // A cancel is already on its way.
-                        "DUPLICATE_CANCEL_REQUEST" => CancelOutcome::Requested,
-                        "NOT_ALLOWED_TO_CANCEL" => {
-                            CancelOutcome::Rejected("This order cannot be cancelled.".to_owned())
-                        }
-                        other => CancelOutcome::Rejected(mapping::humanise(other)),
-                    },
-                };
-                results.push(CancelResult {
+        let mut stopped = false;
+        for (index, chunk) in orders.chunks(CANCEL_BATCH).enumerate() {
+            if stopped {
+                // Not tried: an earlier batch failed, and the same thing would likely fail again.
+                results.extend(chunk.iter().map(|id| CancelResult {
                     order_id: id.clone(),
-                    outcome,
-                });
+                    outcome: CancelOutcome::Rejected(
+                        "Not sent: an earlier cancel failed, so this one was not tried.".to_owned(),
+                    ),
+                }));
+                continue;
             }
+            match self.cancel_batch(chunk) {
+                Ok(done) => results.extend(done),
+                // Nothing to keep yet: the whole request failed.
+                Err(error) if index == 0 => return Err(error),
+                // Earlier batches were sent and answered: their results stand. This batch is
+                // reported by what is known of it, never dropped with them.
+                Err(error) => {
+                    let text = error.to_string();
+                    results.extend(chunk.iter().map(|id| CancelResult {
+                        order_id: id.clone(),
+                        outcome: if error.kind == ErrorKind::OutcomeUnknown {
+                            CancelOutcome::Unknown(text.clone())
+                        } else {
+                            CancelOutcome::Rejected(text.clone())
+                        },
+                    }));
+                    stopped = true;
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn cancel_batch(&self, chunk: &[OrderId]) -> Result<Vec<CancelResult>> {
+        let ids: Vec<&str> = chunk.iter().map(OrderId::as_str).collect();
+        let value = self
+            .http
+            .post(&path("/orders/batch_cancel"), &json!({ "order_ids": ids }))?;
+        let response: CancelResponse = serde_json::from_value(value).map_err(|_| {
+            BrokerError::new(
+                ErrorKind::OutcomeUnknown,
+                "Coinbase's reply to the cancel could not be read. Check the order's status.",
+            )
+        })?;
+        let mut results = Vec::with_capacity(chunk.len());
+        for id in chunk {
+            let entry = response.results.iter().find(|r| r.order_id == id.as_str());
+            let outcome = match entry {
+                None => CancelOutcome::Rejected(
+                    "Coinbase did not say what happened to this cancel.".to_owned(),
+                ),
+                Some(entry) if entry.success => CancelOutcome::Requested,
+                Some(entry) => match entry.failure_reason.as_str() {
+                    "ORDER_IS_FULLY_FILLED" => CancelOutcome::AlreadyFilled,
+                    "UNKNOWN_CANCEL_ORDER" => CancelOutcome::NotFound,
+                    "ORDER_IS_BEING_REPLACED" => CancelOutcome::BeingReplaced,
+                    // A cancel is already on its way.
+                    "DUPLICATE_CANCEL_REQUEST" => CancelOutcome::Requested,
+                    "NOT_ALLOWED_TO_CANCEL" => {
+                        CancelOutcome::Rejected("This order cannot be cancelled.".to_owned())
+                    }
+                    other => CancelOutcome::Rejected(mapping::humanise(other)),
+                },
+            };
+            results.push(CancelResult {
+                order_id: id.clone(),
+                outcome,
+            });
         }
         Ok(results)
     }
@@ -313,19 +348,35 @@ impl CoinbaseConnection {
         })
     }
 
+    /// Every order that may still trade. Coinbase refuses a listing that names several active
+    /// statuses (it said so on the first real run), so each is asked for on its own and the answers
+    /// are merged, an order once even if two answers carry it.
     pub(super) fn do_open_orders(&self) -> Result<Vec<LiveOrder>> {
         let filter = HistoryFilter::default();
-        let mut orders = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..MAX_OPEN_PAGES {
-            let page = self.orders_page(&WORKING_STATUSES, &filter, cursor.as_deref(), MAX_PAGE)?;
-            orders.extend(page.items);
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => return Ok(orders),
+        let mut orders: Vec<LiveOrder> = Vec::new();
+        for status in WORKING_STATUSES {
+            let mut cursor: Option<String> = None;
+            let mut finished = false;
+            for _ in 0..MAX_OPEN_PAGES {
+                let page = self.orders_page(&[status], &filter, cursor.as_deref(), MAX_PAGE)?;
+                for order in page.items {
+                    if !orders.iter().any(|known| known.id == order.id) {
+                        orders.push(order);
+                    }
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            if !finished {
+                return Err(unreadable("an order list that never ends"));
             }
         }
-        Err(unreadable("an order list that never ends"))
+        Ok(orders)
     }
 
     pub(super) fn do_order_history(
@@ -339,6 +390,14 @@ impl CoinbaseConnection {
             .flat_map(|status| mapping::status_query(*status).iter().copied())
             .collect();
         let limit = if filter.limit == 0 { 100 } else { filter.limit };
+        // Several statuses with an active one among them is refused by Coinbase, and one cursor
+        // cannot page through several listings. So ask for everything and keep what was wanted.
+        if statuses.len() > 1 && statuses.iter().any(|s| WORKING_STATUSES.contains(s)) {
+            let mut page = self.orders_page(&[], filter, cursor, limit)?;
+            page.items
+                .retain(|order| filter.statuses.contains(&order.status));
+            return Ok(page);
+        }
         self.orders_page(&statuses, filter, cursor, limit)
     }
 

@@ -281,7 +281,9 @@ fn retrying_looks_first_and_reuses_the_same_client_id() {
         .unresolved(BrokerId::new("coinbase"))
         .unwrap()
         .remove(0);
-    let placed = submit::retry(connection.as_ref(), &journal, &RULES, &entry, NOW + 3_000).unwrap();
+    let placed = submit::retry(connection.as_ref(), &journal, &RULES, &entry, NOW + 3_000)
+        .unwrap()
+        .placed;
     assert_eq!(placed.product.as_str(), "BTC-USD");
     assert_eq!(fake.posts_to_create(), 1, "found, not doubled");
 
@@ -505,6 +507,73 @@ fn orders_stay_open_until_they_leave_the_working_set_and_history_filters_by_stat
     assert!(query.contains("order_status=FILLED"), "{query}");
 }
 
+/// Coinbase refuses a listing that asks for several active statuses at once. The working set is
+/// every active status, so each is asked for on its own and the answers are merged, once each.
+#[test]
+fn the_working_orders_are_listed_one_active_status_at_a_time() {
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    for n in 0..5 {
+        connection
+            .place(&limit_buy(), &ClientOrderId::new(format!("w{n}")))
+            .unwrap();
+    }
+    fake.with_state(|s| {
+        for (order, status) in
+            s.orders
+                .iter_mut()
+                .zip(["OPEN", "PENDING", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED"])
+        {
+            order.status = status.to_owned();
+        }
+    });
+    let open = connection.open_orders().expect("the working orders");
+    assert_eq!(open.len(), 5, "every active status is listed: {open:?}");
+    let mut ids: Vec<_> = open.iter().map(|o| o.id.clone()).collect();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    ids.dedup();
+    assert_eq!(ids.len(), 5, "and none twice");
+}
+
+/// A history filter that spans several statuses, one of them active, is answered too.
+#[test]
+fn a_history_filter_across_active_statuses_is_not_sent_as_several_at_once() {
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    for n in 0..3 {
+        connection
+            .place(&limit_buy(), &ClientOrderId::new(format!("h{n}")))
+            .unwrap();
+    }
+    fake.with_state(|s| {
+        s.orders[0].status = "OPEN".to_owned();
+        s.orders[1].status = "QUEUED".to_owned();
+        s.orders[2].status = "FILLED".to_owned();
+    });
+    let pending = connection
+        .order_history(
+            &HistoryFilter {
+                statuses: vec![OrderStatus::Pending],
+                ..HistoryFilter::default()
+            },
+            None,
+        )
+        .expect("pending alone (PENDING and QUEUED)");
+    assert_eq!(pending.items.len(), 1);
+    let mixed = connection
+        .order_history(
+            &HistoryFilter {
+                statuses: vec![OrderStatus::Open, OrderStatus::Filled],
+                ..HistoryFilter::default()
+            },
+            None,
+        )
+        .expect("an active and a finished status together");
+    let mut statuses: Vec<_> = mixed.items.iter().map(|o| o.status).collect();
+    statuses.sort_by_key(|s| format!("{s:?}"));
+    assert_eq!(statuses, vec![OrderStatus::Filled, OrderStatus::Open]);
+}
+
 #[test]
 fn fills_fees_and_a_missing_order_are_read() {
     let fake = FakeCoinbase::start();
@@ -579,4 +648,161 @@ fn market_orders_by_quote_and_stop_limits_serialise_as_documented() {
         sent["market_market_ioc"].get("base_size").is_none(),
         "only one size basis is sent"
     );
+}
+
+#[test]
+fn an_answer_that_cannot_be_read_never_says_not_sent_and_keeps_the_record() {
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    let journal = MemoryJournal::new();
+    fake.with_state(|s| s.garble_create_reply = true);
+    let client_id = new_client_order_id(&RULES).unwrap();
+
+    let error =
+        submit::submit(connection.as_ref(), &journal, &limit_buy(), &client_id, NOW).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::OutcomeUnknown, "{error:?}");
+    assert_eq!(fake.with_state(|s| s.orders.len()), 1, "it was created");
+    assert_eq!(
+        journal.unresolved(BrokerId::new("coinbase")).unwrap().len(),
+        1,
+        "and is still recorded, so it can be found"
+    );
+    let entry = journal
+        .unresolved(BrokerId::new("coinbase"))
+        .unwrap()
+        .remove(0);
+    let found = submit::reconcile(connection.as_ref(), &journal, &entry, NOW + 5_000).unwrap();
+    assert!(matches!(found, Reconciled::Placed(_)));
+    assert_eq!(fake.posts_to_create(), 1);
+}
+
+#[test]
+fn an_accepted_order_is_placed_even_if_the_journal_cannot_be_updated() {
+    use std::sync::atomic::Ordering;
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    let journal = MemoryJournal::new();
+    journal.fail_to_resolve.store(true, Ordering::SeqCst);
+    let client_id = new_client_order_id(&RULES).unwrap();
+
+    let submitted =
+        submit::submit(connection.as_ref(), &journal, &limit_buy(), &client_id, NOW).unwrap();
+    assert_eq!(submitted.placed.order_id.as_str(), "order-1");
+    assert!(
+        submitted.unsettled.is_some(),
+        "the failure is reported alongside, not instead"
+    );
+    assert_eq!(
+        journal.unresolved(BrokerId::new("coinbase")).unwrap().len(),
+        1,
+        "the entry stays until it can be closed"
+    );
+
+    // Found later, with the journal still broken: the order is returned, flagged.
+    let entry = journal
+        .unresolved(BrokerId::new("coinbase"))
+        .unwrap()
+        .remove(0);
+    let found = submit::reconcile(connection.as_ref(), &journal, &entry, NOW + 5_000).unwrap();
+    assert!(
+        matches!(found, Reconciled::PlacedUnsettled(_, _)),
+        "{found:?}"
+    );
+    // And closed once the journal works again, with nothing sent.
+    journal.fail_to_resolve.store(false, Ordering::SeqCst);
+    let found = submit::reconcile(connection.as_ref(), &journal, &entry, NOW + 6_000).unwrap();
+    assert!(matches!(found, Reconciled::Placed(_)));
+    assert!(
+        journal
+            .unresolved(BrokerId::new("coinbase"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fake.posts_to_create(), 1);
+}
+
+fn many_resting_orders(fake: &FakeCoinbase, count: usize) -> Vec<OrderId> {
+    use super::fake::FakeOrder;
+    fake.with_state(|state| {
+        (0..count)
+            .map(|n| {
+                let id = format!("bulk-{n}");
+                state.orders.push(FakeOrder {
+                    id: id.clone(),
+                    client_id: format!("bulk-client-{n}"),
+                    product: "BTC-USD".to_owned(),
+                    side: "BUY".to_owned(),
+                    status: "OPEN".to_owned(),
+                    configuration: serde_json::json!({"limit_limit_gtc": {
+                        "base_size": "0.001", "limit_price": "90000.00", "post_only": false}}),
+                    filled_size: "0".to_owned(),
+                    created_time: "2026-11-09T12:00:00.000Z".to_owned(),
+                });
+                OrderId::new(id)
+            })
+            .collect()
+    })
+}
+
+#[test]
+fn a_cancel_that_fails_in_a_later_batch_keeps_what_the_earlier_batches_did() {
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    // 250 orders go out in batches of 100, 100 and 50; the second batch's answer is a 502.
+    let ids = many_resting_orders(&fake, 250);
+    fake.with_state(|s| s.fail_cancel_batch = Some(1));
+
+    let results = connection.cancel(&ids).unwrap();
+    assert_eq!(results.len(), 250, "every order is accounted for");
+    assert!(
+        results[..100]
+            .iter()
+            .all(|r| r.outcome == CancelOutcome::Requested),
+        "the first batch was sent and answered"
+    );
+    assert!(
+        results[100..200]
+            .iter()
+            .all(|r| matches!(r.outcome, CancelOutcome::Unknown(_))),
+        "the second may have been carried out: not 'refused'"
+    );
+    assert!(
+        results[200..].iter().all(
+            |r| matches!(&r.outcome, CancelOutcome::Rejected(text) if text.contains("Not sent"))
+        ),
+        "the third was not tried"
+    );
+    assert_eq!(
+        fake.with_state(|s| s.cancel_batches_seen),
+        2,
+        "and not sent"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|r| r.order_id.clone())
+            .collect::<Vec<_>>(),
+        ids,
+        "in the order asked"
+    );
+
+    // A request that fails at the first batch has nothing to keep and fails as a whole.
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    let ids = many_resting_orders(&fake, 150);
+    fake.with_state(|s| s.fail_cancel_batch = Some(0));
+    let error = connection.cancel(&ids).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::OutcomeUnknown);
+}
+
+#[test]
+fn a_broker_that_cannot_preview_says_so_and_places_nothing() {
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    fake.with_state(|s| s.fail_preview = true);
+    let error = connection.preview(&limit_buy()).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Rejected, "{error:?}");
+    assert_eq!(fake.posts_to_create(), 0);
+    fake.with_state(|s| s.fail_preview = false);
+    assert!(connection.preview(&limit_buy()).unwrap().is_acceptable());
 }

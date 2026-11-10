@@ -21,6 +21,9 @@ fn main() {
     );
     println!("  cargo run --release --features dev-mock-broker\n");
     println!("API key name:\n  {KEY_NAME}\n");
-    println!("Private key (a throwaway; the mock accepts any key):\n{}", generate_key_pem());
+    println!(
+        "Private key (a throwaway; the mock accepts any key):\n{}",
+        generate_key_pem()
+    );
     std::thread::park();
 }

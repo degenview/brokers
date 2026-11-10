@@ -60,6 +60,10 @@ pub struct MemoryJournal {
     entries: Mutex<BTreeMap<(String, String), PendingSubmission>>,
     /// Test hook: make `record` fail.
     pub fail_to_record: std::sync::atomic::AtomicBool,
+    /// Test hook: make `resolve` fail (the entry stays).
+    pub fail_to_resolve: std::sync::atomic::AtomicBool,
+    /// Test hook: make `unresolved` fail, as a corrupt record would.
+    pub fail_to_read: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryJournal {
@@ -92,6 +96,12 @@ impl PendingJournal for MemoryJournal {
         client_id: &ClientOrderId,
         _outcome: &SubmissionOutcome,
     ) -> Result<(), JournalError> {
+        if self
+            .fail_to_resolve
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(JournalError("the journal is not writable".to_owned()));
+        }
         self.entries
             .lock()
             .map_err(|_| JournalError("journal poisoned".to_owned()))?
@@ -100,6 +110,9 @@ impl PendingJournal for MemoryJournal {
     }
 
     fn unresolved(&self, broker: BrokerId) -> Result<Vec<PendingSubmission>, JournalError> {
+        if self.fail_to_read.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(JournalError("the journal cannot be read".to_owned()));
+        }
         Ok(self
             .entries
             .lock()
