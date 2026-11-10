@@ -727,3 +727,15 @@ fn a_cancel_that_fails_in_a_later_batch_keeps_what_the_earlier_batches_did() {
     let error = connection.cancel(&ids).unwrap_err();
     assert_eq!(error.kind, ErrorKind::OutcomeUnknown);
 }
+
+#[test]
+fn a_broker_that_cannot_preview_says_so_and_places_nothing() {
+    let fake = FakeCoinbase::start();
+    let connection = connect(&fake);
+    fake.with_state(|s| s.fail_preview = true);
+    let error = connection.preview(&limit_buy()).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Rejected, "{error:?}");
+    assert_eq!(fake.posts_to_create(), 0);
+    fake.with_state(|s| s.fail_preview = false);
+    assert!(connection.preview(&limit_buy()).unwrap().is_acceptable());
+}

@@ -72,6 +72,8 @@ pub struct State {
     pub refuse_create_with: Option<String>,
     /// Answer the next N requests with 429.
     pub rate_limit_next: usize,
+    /// Answer every preview (order and edit) with a 422, as a broker that cannot preview would.
+    pub fail_preview: bool,
     /// Answer the Nth (from 0) `batch_cancel` request with a 502.
     pub fail_cancel_batch: Option<usize>,
     /// How many `batch_cancel` requests were received.
@@ -239,6 +241,10 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
         ("GET", "/transaction_summary") => Reply::json(
             200,
             r#"{"fee_tier":{"pricing_tier":"Advanced 1","maker_fee_rate":"0.004","taker_fee_rate":"0.006"}}"#,
+        ),
+        ("POST", "/orders/preview" | "/orders/edit_preview") if state.fail_preview => Reply::json(
+            422,
+            r#"{"message":"preview is unavailable","code":"UNAVAILABLE"}"#,
         ),
         ("POST", "/orders/preview") => {
             let body: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
