@@ -9,6 +9,8 @@ pub fn all() -> Vec<&'static dyn Broker> {
     vec![
         #[cfg(feature = "coinbase")]
         &crate::coinbase::Coinbase,
+        #[cfg(feature = "coinbase")]
+        &crate::coinbase::CoinbaseSandbox,
     ]
 }
 

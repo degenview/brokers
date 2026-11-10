@@ -21,10 +21,14 @@ use crate::model::types::ProductId;
 use crate::secret::Credentials;
 
 pub use connection::CoinbaseConnection;
-pub use descriptor::{DESCRIPTOR, FIELD_NAME, FIELD_PRIVATE_KEY, ID};
+pub use descriptor::{
+    DESCRIPTOR, FIELD_NAME, FIELD_PRIVATE_KEY, ID, SANDBOX_DESCRIPTOR, SANDBOX_ID,
+};
 
 /// The production API host.
 pub(crate) const BASE_URL: &str = "https://api.coinbase.com";
+/// Coinbase's sandbox host: canned answers for accounts and orders, no authentication.
+pub(crate) const SANDBOX_URL: &str = "https://api-sandbox.coinbase.com";
 /// Every Advanced Trade path starts with this.
 pub(crate) const PREFIX: &str = "/api/v3/brokerage";
 
@@ -36,19 +40,39 @@ impl Broker for Coinbase {
     }
 
     fn resolve_market(&self, market: &MarketRef) -> ProductResolution {
-        if !market.source.eq_ignore_ascii_case(DESCRIPTOR.market_source) {
-            return ProductResolution::OtherSource {
-                expected: DESCRIPTOR.market_source,
-            };
-        }
-        match product_id_for_symbol(&market.symbol) {
-            Some(id) => ProductResolution::Market(id),
-            None => ProductResolution::Unrecognised,
-        }
+        resolve(DESCRIPTOR.market_source, market)
     }
 
     fn connect(&self, credentials: &Credentials, env: &Env) -> Result<Box<dyn Connection>> {
         CoinbaseConnection::open(credentials, env).map(|c| Box::new(c) as Box<dyn Connection>)
+    }
+}
+
+fn resolve(expected: &'static str, market: &MarketRef) -> ProductResolution {
+    if !market.source.eq_ignore_ascii_case(expected) {
+        return ProductResolution::OtherSource { expected };
+    }
+    match product_id_for_symbol(&market.symbol) {
+        Some(id) => ProductResolution::Market(id),
+        None => ProductResolution::Unrecognised,
+    }
+}
+
+/// Coinbase's sandbox as a broker of its own: it trades the same markets as Coinbase, on canned
+/// data, and needs no key.
+pub struct CoinbaseSandbox;
+
+impl Broker for CoinbaseSandbox {
+    fn descriptor(&self) -> &'static Descriptor {
+        &SANDBOX_DESCRIPTOR
+    }
+
+    fn resolve_market(&self, market: &MarketRef) -> ProductResolution {
+        resolve(SANDBOX_DESCRIPTOR.market_source, market)
+    }
+
+    fn connect(&self, _credentials: &Credentials, env: &Env) -> Result<Box<dyn Connection>> {
+        CoinbaseConnection::open_sandbox(env).map(|c| Box::new(c) as Box<dyn Connection>)
     }
 }
 

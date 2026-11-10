@@ -3,16 +3,16 @@
 use rust_decimal::Decimal;
 use std::sync::Arc;
 
-use super::descriptor::{DESCRIPTOR, FIELD_NAME, FIELD_PRIVATE_KEY, ID};
+use super::descriptor::{DESCRIPTOR, FIELD_NAME, FIELD_PRIVATE_KEY, ID, SANDBOX_ID};
 use super::jwt::JwtSigner;
 use super::stream::{self, USER_HOST};
 use super::time::parse_rfc3339_ms;
 use super::wire::{
     AccountsPage, BestBidAsk, KeyPermissions, ProductDto, ProductsPage, parse_decimal,
 };
-use super::{BASE_URL, PREFIX};
+use super::{BASE_URL, PREFIX, SANDBOX_URL};
 use crate::adapter::{Clock, Connection, Env, Session, StreamHandle, StreamTiming};
-use crate::auth::RequestSigner;
+use crate::auth::{RequestParts, RequestSigner};
 use crate::error::{BrokerError, ErrorKind, Result};
 use crate::http::HttpClient;
 use crate::model::capabilities::{Capabilities, Tradability};
@@ -40,10 +40,29 @@ pub struct CoinbaseConnection {
     pub(super) http: HttpClient,
     session: Session,
     pub(super) clock: Arc<dyn Clock>,
-    signer: Arc<JwtSigner>,
+    /// `None` in the sandbox, which takes no key.
+    signer: Option<Arc<JwtSigner>>,
     ws_url: String,
     timing: StreamTiming,
+    id: BrokerId,
+    sandbox: bool,
 }
+
+/// The sandbox asks for no authentication: nothing is signed and nothing secret is sent.
+struct Unsigned;
+
+impl RequestSigner for Unsigned {
+    fn headers(&self, _request: &RequestParts<'_>) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+}
+
+/// The markets the sandbox is offered with. Its API has no product list, so these are the usual
+/// rules for two markets, not Coinbase's live ones; the sandbox answers canned data either way.
+const SANDBOX_MARKETS: &str = r#"[
+    {"product_id":"BTC-USD","base_currency_id":"BTC","quote_currency_id":"USD","display_name":"BTC-USD","price_increment":"0.01","base_increment":"0.00000001","quote_increment":"0.01","base_min_size":"0.00000001","quote_min_size":"1","status":"online","product_type":"SPOT"},
+    {"product_id":"ETH-USD","base_currency_id":"ETH","quote_currency_id":"USD","display_name":"ETH-USD","price_increment":"0.01","base_increment":"0.00000001","quote_increment":"0.01","base_min_size":"0.00000001","quote_min_size":"1","status":"online","product_type":"SPOT"}
+]"#;
 
 pub(super) fn path(suffix: &str) -> String {
     format!("{PREFIX}{suffix}")
@@ -122,10 +141,70 @@ impl CoinbaseConnection {
             http,
             session,
             clock: Arc::clone(&env.clock),
-            signer,
+            signer: Some(signer),
             ws_url: env.ws_url().unwrap_or(USER_HOST).to_owned(),
             timing: env.stream_timing,
+            id: ID,
+            sandbox: false,
         })
+    }
+
+    /// Connects to Coinbase's sandbox. It takes no key and has no permissions endpoint, so the
+    /// session says what it is: a view and trade session on a canned account. Nothing is read.
+    pub fn open_sandbox(env: &Env) -> Result<Self> {
+        let base = env.base_url().unwrap_or(SANDBOX_URL);
+        let http = HttpClient::new(
+            base,
+            Arc::new(Unsigned) as Arc<dyn RequestSigner>,
+            Scrubber::new(std::iter::empty()),
+            env.request_gap(super::descriptor::SANDBOX_DESCRIPTOR.min_request_gap_ms),
+        );
+        Ok(Self {
+            http,
+            session: Session {
+                permissions: Permissions {
+                    can_view: true,
+                    can_trade: true,
+                    can_transfer: false,
+                },
+                accounts: vec![AccountRef {
+                    id: AccountId::new("sandbox"),
+                    label: "Sandbox account".to_owned(),
+                    kind: AccountKind::Spot,
+                }],
+            },
+            clock: Arc::clone(&env.clock),
+            signer: None,
+            ws_url: String::new(),
+            timing: env.stream_timing,
+            id: SANDBOX_ID,
+            sandbox: true,
+        })
+    }
+
+    fn sandbox_markets(&self) -> Vec<ProductSpec> {
+        serde_json::from_str::<Vec<ProductDto>>(SANDBOX_MARKETS)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|dto| self.spec_from(dto))
+            .collect()
+    }
+
+    /// A stream that never connects: the sandbox has none. The connection reads on a timer.
+    fn idle_stream() -> StreamHandle {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let reconnect = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("coinbase-sandbox-idle".to_owned())
+            .spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+            .expect("spawn the idle stream");
+        StreamHandle::new(stop, reconnect, thread)
     }
 
     fn account_id(&self) -> AccountId {
@@ -192,7 +271,7 @@ fn title_case(text: &str) -> String {
 
 impl Connection for CoinbaseConnection {
     fn broker(&self) -> BrokerId {
-        ID
+        self.id
     }
 
     fn session(&self) -> &Session {
@@ -240,6 +319,9 @@ impl Connection for CoinbaseConnection {
     }
 
     fn products(&self) -> Result<Vec<ProductSpec>> {
+        if self.sandbox {
+            return Ok(self.sandbox_markets());
+        }
         let mut specs = Vec::new();
         let mut offset = 0_usize;
         for _ in 0..MAX_PAGES {
@@ -268,6 +350,18 @@ impl Connection for CoinbaseConnection {
     }
 
     fn product(&self, id: &ProductId) -> Result<ProductSpec> {
+        if self.sandbox {
+            return self
+                .sandbox_markets()
+                .into_iter()
+                .find(|spec| &spec.id == id)
+                .ok_or_else(|| {
+                    BrokerError::new(
+                        ErrorKind::Unsupported,
+                        format!("The sandbox offers BTC-USD and ETH-USD only, not {id}."),
+                    )
+                });
+        }
         let value = self.http.get(
             &path(&format!("/products/{}", id.as_str())),
             &[("get_tradability_status", "true")],
@@ -285,6 +379,12 @@ impl Connection for CoinbaseConnection {
     }
 
     fn quote(&self, id: &ProductId) -> Result<Quote> {
+        if self.sandbox {
+            return Err(BrokerError::new(
+                ErrorKind::Unsupported,
+                "Coinbase's sandbox has no prices.",
+            ));
+        }
         let book: BestBidAsk = decode(
             self.http
                 .get(&path("/best_bid_ask"), &[("product_ids", id.as_str())])?,
@@ -354,15 +454,24 @@ impl Connection for CoinbaseConnection {
     }
 
     fn fee_summary(&self) -> Result<FeeSummary> {
+        if self.sandbox {
+            return Err(BrokerError::new(
+                ErrorKind::Unsupported,
+                "Coinbase's sandbox has no fee tiers.",
+            ));
+        }
         self.do_fee_summary()
     }
 
     fn open_stream(&self, sink: Arc<dyn EventSink>) -> Result<StreamHandle> {
+        let Some(signer) = &self.signer else {
+            return Ok(Self::idle_stream());
+        };
         Ok(stream::spawn(
             stream::Config {
                 url: self.ws_url.clone(),
                 scrubber: self.http.scrubber().clone(),
-                signer: Arc::clone(&self.signer),
+                signer: Arc::clone(signer),
                 clock: Arc::clone(&self.clock),
                 timing: self.timing,
             },
@@ -689,6 +798,79 @@ mod tests {
         assert_eq!(products[0].quote_increment.to_string(), "0.05");
         assert_eq!(products[0].quote_min.to_string(), "0");
         assert_eq!(products[0].base_min.to_string(), "0.01");
+    }
+
+    fn sandbox(server: &MockServer) -> Box<dyn Connection> {
+        crate::coinbase::CoinbaseSandbox
+            .connect(
+                &Credentials::new(),
+                &Env::default().with_loopback_base_url(server.url.clone()),
+            )
+            .expect("the sandbox connects without a key")
+    }
+
+    #[test]
+    fn the_sandbox_needs_no_key_signs_nothing_and_is_a_broker_of_its_own() {
+        let server = MockServer::start(exchange);
+        let connection = sandbox(&server);
+        assert_eq!(connection.broker(), SANDBOX_ID);
+        assert_ne!(connection.broker(), ID);
+        let session = connection.session();
+        assert!(session.permissions.can_trade && !session.permissions.can_transfer);
+        // Connecting read nothing, and nothing it reads carries an authorization header.
+        assert!(
+            server.requests().is_empty(),
+            "no permissions endpoint exists in the sandbox"
+        );
+        connection.balances().expect("balances");
+        connection.open_orders().ok();
+        for request in server.requests() {
+            assert!(
+                request.header("authorization").is_none(),
+                "{} was signed",
+                request.path()
+            );
+        }
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|r| r.path().ends_with("/key_permissions") || r.path().ends_with("/products"))
+        );
+    }
+
+    #[test]
+    fn the_sandbox_offers_two_markets_has_no_prices_or_fee_tiers_and_an_idle_stream() {
+        let server = MockServer::start(exchange);
+        let connection = sandbox(&server);
+        let markets: Vec<String> = connection
+            .products()
+            .unwrap()
+            .iter()
+            .map(|p| p.id.to_string())
+            .collect();
+        assert_eq!(markets, ["BTC-USD", "ETH-USD"]);
+        assert!(connection.product(&ProductId::new("BTC-USD")).is_ok());
+        let unknown = connection.product(&ProductId::new("DOGE-USD")).unwrap_err();
+        assert_eq!(unknown.kind, ErrorKind::Unsupported);
+        assert_eq!(
+            connection
+                .quote(&ProductId::new("BTC-USD"))
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert!(connection.fee_summary().is_err());
+        // Its stream never connects, and stops at once when asked.
+        struct Quiet;
+        impl EventSink for Quiet {
+            fn event(&self, _event: crate::model::events::StreamEvent) {}
+        }
+        let mut stream = connection.open_stream(Arc::new(Quiet)).expect("a stream");
+        let started = std::time::Instant::now();
+        stream.stop();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(server.requests().iter().all(|r| !r.path().contains("ws")));
     }
 
     #[test]

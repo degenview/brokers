@@ -102,6 +102,33 @@ cancel racing a fill, a lost reply, a refusal, an invalid order, a stream drop, 
 a revoked key and a rate limit, and four on the record of unconfirmed orders (unreadable later,
 unreadable at start, an accepted order whose record cannot be closed, a failed lookup).
 
+## The sandbox
+
+`CoinbaseSandbox` (id `coinbase-sandbox`, listed after Coinbase) is Coinbase's Advanced Trade
+sandbox as a broker of its own, so a test connection can never be mistaken for a real one. It is
+checked against the real sandbox (`cargo run --example sandbox_check`), not against its documentation
+alone.
+
+What it is, from what the sandbox answers:
+
+* Host `https://api-sandbox.coinbase.com`, same `/api/v3/brokerage` paths. **No authentication**: it
+  answers unsigned requests, so the broker has no credential fields and nothing is signed or
+  stored. Coinbase issues no "sandbox keys".
+* **Canned answers.** Accounts, orders, fills and previews are fixed examples. Placing, editing or
+  cancelling an order succeeds but changes nothing; the order you placed is not listed afterwards,
+  and looking it up by id is refused (`invalid OrderId`). An order placed here is therefore shown
+  as placed, never as resting.
+* **Missing endpoints** (they answer 404): key permissions, the market list, best bid and ask, the
+  fee summary. So the session is synthesised (view and trade, no transfer, one "Sandbox account"),
+  the markets are a built-in pair (BTC-USD and ETH-USD, with the usual increments, not Coinbase's
+  live rules), there are no prices (the order pills show no bid or ask) and no fee tiers.
+* **No WebSocket.** Its stream never connects; the connection is current after each read, which
+  the runtime repeats on its timer.
+* It trades the markets of the `coinbase` data source, the same as Coinbase.
+
+Not verified: that these canned answers stay as they are. The sandbox's own page documents only
+accounts and orders, and says its answers are static.
+
 ## Not verified against the live service
 
 These could not be confirmed from Coinbase's documentation and have **not** been run against a real
