@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use super::fake::{CoinbaseExchange, FakeCoinbase, credentials, generate_key_pem};
 use super::{Coinbase, CoinbaseSandbox};
-use crate::adapter::{Broker, Env};
+use crate::adapter::{Broker, Clock, Env};
 use crate::error::ErrorKind;
 use crate::model::orders::{OrderChange, OrderFingerprint};
 use crate::model::pending::{MemoryJournal, PendingJournal, PendingSubmission};
@@ -507,7 +507,20 @@ fn a_price_without_the_exchanges_time_is_not_a_price() {
         )
         .unwrap();
     let quote = connection.quote(&ProductId::new("BTC-USD")).unwrap();
-    assert_eq!(quote.time_ms, 1_794_225_600_000, "the exchange's own time");
+    let now = crate::adapter::SystemClock.now_ms();
+    assert!(
+        (now - quote.time_ms).abs() < 5_000,
+        "the exchange's own time, not made up"
+    );
+    fake.with_state(|state| state.quote_time = "2026-11-09T12:00:00Z".to_owned());
+    assert_eq!(
+        connection
+            .quote(&ProductId::new("BTC-USD"))
+            .unwrap()
+            .time_ms,
+        1_794_225_600_000,
+        "an old time stays old"
+    );
 
     fake.with_state(|state| state.quote_without_time = true);
     let error = connection.quote(&ProductId::new("BTC-USD")).unwrap_err();

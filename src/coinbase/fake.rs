@@ -99,8 +99,10 @@ pub struct State {
     pub status_after_create: Option<u16>,
     /// Answer the next order write (create, cancel or edit) with this HTTP status, doing nothing.
     pub status_for_next_write: Option<u16>,
-    /// Leave the `time` out of the next best-bid-ask answer.
+    /// Leave the `time` out of the best-bid-ask answers.
     pub quote_without_time: bool,
+    /// The `time` of the best-bid-ask answers (RFC 3339). Empty means "now", as a live exchange's.
+    pub quote_time: String,
     /// Answer every lookup of one order by id with the 400 Coinbase's sandbox gives, which does
     /// not keep the orders it is sent.
     pub order_lookup_invalid: bool,
@@ -256,10 +258,21 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
             200,
             r#"{"pricebooks":[{"product_id":"BTC-USD","bids":[{"price":"89999.50","size":"1"}],"asks":[{"price":"90000.50","size":"1"}]}]}"#,
         ),
-        ("GET", "/best_bid_ask") => Reply::json(
-            200,
-            r#"{"pricebooks":[{"product_id":"BTC-USD","bids":[{"price":"89999.50","size":"1"}],"asks":[{"price":"90000.50","size":"1"}],"time":"2026-11-09T12:00:00Z"}]}"#,
-        ),
+        ("GET", "/best_bid_ask") => {
+            let time = if state.quote_time.is_empty() {
+                super::time::format_rfc3339_ms(crate::adapter::Clock::now_ms(
+                    &crate::adapter::SystemClock,
+                ))
+            } else {
+                state.quote_time.clone()
+            };
+            Reply::json(
+                200,
+                format!(
+                    r#"{{"pricebooks":[{{"product_id":"BTC-USD","bids":[{{"price":"89999.50","size":"1"}}],"asks":[{{"price":"90000.50","size":"1"}}],"time":"{time}"}}]}}"#
+                ),
+            )
+        }
         ("POST", "/orders" | "/orders/batch_cancel" | "/orders/edit")
             if state.status_for_next_write.is_some() =>
         {
