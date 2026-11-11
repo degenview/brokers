@@ -38,7 +38,13 @@ for balance in connection.balances()? {
 * A signed request is never replayed at another host, never retried if it writes, and never leaves
   an error with a credential in it.
 * An order whose submission did not finish is `OutcomeUnknown`: the caller must look it up before
-  doing anything else.
+  doing anything else. A 409 on a write counts as unfinished, never as a refusal.
+* An unconfirmed order belongs to the account (portfolio) that sent it. Only a session on that
+  account looks it up, settles it or sends it again; another account's records are held untouched
+  (`BrokerSnapshot::held_elsewhere`), and a record that names no account is held for good. Orders,
+  previews and edits name the account they were made for, and the runtime refuses them if it
+  trades in another; an edit also names the order it was reviewed against and is refused if that
+  changed.
 * There is no code that moves funds off the exchange, and the adapters ask for no permission that
   would allow it.
 

@@ -52,8 +52,11 @@ live service does is not verified.
 What counts as "not sent", and what does not:
 
 * **Not sent** is said only when nothing left the machine (the order could not be recorded, failed
-  local validation, or could not be signed) or Coinbase clearly refused it (a 400, 401, 403, 409 or
+  local validation, or could not be signed) or Coinbase clearly refused it (a 400, 401, 403 or
   422, or a `success: false` answer with a reason).
+* **A 409 on a write is unknown**, not a refusal: it is how a service may say "that client order
+  id already exists", and the order may be live. The journal entry stays and a lookup settles it. A
+  cancel or an edit answered 409 is read again. (A 409 on a read is still a refusal.)
 * **Unknown** is anything else that happened after the request went out: a connection that failed
   part-way, a 5xx, a redirect, a status that is not on the list, a success whose body cannot be
   read, or a success without an order id. The journal entry stays and a lookup settles it.
@@ -64,6 +67,16 @@ What counts as "not sent", and what does not:
   orders (`BrokerSnapshot::can_send_orders` is false) and keeps trying to read it; reading,
   cancelling and editing keep working. A pending item leaves the screen only when the journal has
   let go of it.
+
+**Accounts.** A Coinbase key is scoped to one portfolio (`portfolio_uuid` from `/key_permissions`),
+and that id is the account of the session. Every journal entry carries it and is keyed by
+`(broker, account, client order id)`. The journal is read only after connecting, for that account:
+entries of another account are not shown, looked up, settled, deleted or sent again (the same
+client id means nothing in another portfolio, and a lookup there would "prove" a live order
+missing), and an entry with no account (written before entries carried one) is held for good.
+Switching keys to another portfolio therefore leaves the first portfolio's unconfirmed orders
+waiting until that key is used again. If Coinbase gives no portfolio id the account is `default`,
+which two such keys would share.
 
 Other rules worth knowing:
 
@@ -146,6 +159,8 @@ key is available, and this list is updated when it is.
 * The `order_status` query parameter's spelling for the list endpoints (`order_status=OPEN`, repeated).
 * Pagination of `/products` (`limit`/`offset` is used; the page size is a guess of 1000).
 * The `status` value for a live market (`online` is assumed).
+* Whether Coinbase ever answers a duplicate client order id with HTTP 409 rather than the existing
+  order; both are handled as "look it up".
 * Regional availability. Nothing documents it beyond the per-product flags and the
   `GEOFENCING_RESTRICTION` order failure.
 

@@ -10,7 +10,11 @@
 //!    is believed only after the broker has had [`SETTLE_MS`] to list it.
 //! 4. Sending again is an explicit act ([`retry`]), uses the **same** client order id, and looks
 //!    first.
-//! 5. "Not sent" is said only when nothing left the machine: the order could not be recorded, or
+//! 5. A submission belongs to the **account** of the session that made it. Only a session on that
+//!    account looks it up, settles it or sends it again; a session on another account (a different
+//!    portfolio or sub-account, say) refuses, because the same client order id means nothing there and a
+//!    "not found" would be a lie that deletes the only record of a live order.
+//! 6. "Not sent" is said only when nothing left the machine: the order could not be recorded, or
 //!    the broker clearly refused it. Once the broker has accepted an order, failing to *update the
 //!    journal* never takes that back: the order is returned as placed, with the failure alongside
 //!    ([`Submitted::unsettled`]), and the entry stays until a lookup can settle it.
@@ -19,7 +23,7 @@ use crate::adapter::{ClientIdRules, Connection};
 use crate::error::{BrokerError, ErrorKind, Result};
 use crate::model::orders::PlacedOrder;
 use crate::model::pending::{JournalError, PendingJournal, PendingSubmission, SubmissionOutcome};
-use crate::model::types::{ClientOrderId, LiveOrder, OrderDraft};
+use crate::model::types::{AccountId, ClientOrderId, LiveOrder, OrderDraft};
 
 /// How long a broker is given to list an order it accepted before "not listed" is believed.
 pub const SETTLE_MS: i64 = 120_000;
@@ -32,6 +36,40 @@ fn journal_failure(error: impl std::fmt::Display) -> BrokerError {
         "The order could not be recorded safely, so it was not sent.",
     )
     .with_detail(error.to_string())
+}
+
+/// The account this connection trades in. A connection that cannot name one cannot send an order:
+/// the record could not say whose it is.
+pub fn session_account(connection: &dyn Connection) -> Result<AccountId> {
+    connection
+        .session()
+        .accounts
+        .first()
+        .map(|account| account.id.clone())
+        .filter(|id| !id.as_str().is_empty())
+        .ok_or_else(|| {
+            BrokerError::new(
+                ErrorKind::Invalid,
+                "The connection does not name an account, so the order was not sent.",
+            )
+        })
+}
+
+fn other_account() -> BrokerError {
+    BrokerError::new(
+        ErrorKind::Invalid,
+        "That order belongs to another account. Nothing was sent or changed.",
+    )
+}
+
+/// The session's account, if `entry` is its own.
+fn own_account(connection: &dyn Connection, entry: &PendingSubmission) -> Result<AccountId> {
+    let account = session_account(connection)?;
+    if entry.belongs_to(&account) {
+        Ok(account)
+    } else {
+        Err(other_account())
+    }
 }
 
 /// An order the broker accepted.
@@ -74,6 +112,7 @@ pub fn submit(
 ) -> Result<Submitted> {
     let entry = PendingSubmission {
         broker: connection.broker(),
+        account: session_account(connection)?,
         client_id: client_id.clone(),
         draft: draft.clone(),
         created_ms: now_ms,
@@ -93,6 +132,7 @@ fn send(
             let unsettled = journal
                 .resolve(
                     entry.broker,
+                    &entry.account,
                     &entry.client_id,
                     &SubmissionOutcome::Placed(placed.order_id.clone()),
                 )
@@ -114,6 +154,7 @@ fn send(
         {
             let _ = journal.resolve(
                 entry.broker,
+                &entry.account,
                 &entry.client_id,
                 &SubmissionOutcome::NotPlaced,
             );
@@ -134,12 +175,14 @@ pub fn reconcile(
     entry: &PendingSubmission,
     now_ms: i64,
 ) -> Result<Reconciled> {
+    own_account(connection, entry)?;
     let since = entry.created_ms.saturating_sub(LOOKBACK_MS);
     match connection.find_by_client_id(&entry.client_id, since)? {
         Some(order) => {
             // Found: it is live whether or not the journal can be told.
             match journal.resolve(
                 entry.broker,
+                &entry.account,
                 &entry.client_id,
                 &SubmissionOutcome::Placed(order.id.clone()),
             ) {
@@ -151,6 +194,7 @@ pub fn reconcile(
             journal
                 .resolve(
                     entry.broker,
+                    &entry.account,
                     &entry.client_id,
                     &SubmissionOutcome::NotPlaced,
                 )
@@ -177,6 +221,7 @@ pub fn retry(
     entry: &PendingSubmission,
     now_ms: i64,
 ) -> Result<Submitted> {
+    own_account(connection, entry)?;
     match reconcile(connection, journal, entry, now_ms)? {
         Reconciled::Placed(order) => {
             return Ok(Submitted {

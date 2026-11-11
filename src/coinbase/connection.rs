@@ -397,11 +397,19 @@ impl Connection for CoinbaseConnection {
             .ok_or_else(|| BrokerError::new(ErrorKind::NotFound, "No prices for that market."))?;
         let top =
             |levels: &[super::wire::Level]| levels.first().and_then(|l| parse_decimal(&l.price));
+        // A price of unknown age is not a price: stamping it with the local clock would show it as
+        // fresh however long it spent on the way. Without the exchange's time there is no quote.
+        let time_ms = parse_rfc3339_ms(&book.time).ok_or_else(|| {
+            BrokerError::new(
+                ErrorKind::Invalid,
+                "Coinbase sent a price without a time, so it is not shown.",
+            )
+        })?;
         Ok(Quote {
             bid: top(&book.bids),
             ask: top(&book.asks),
             last: None,
-            time_ms: parse_rfc3339_ms(&book.time).unwrap_or_else(|| self.clock.now_ms()),
+            time_ms,
         })
     }
 

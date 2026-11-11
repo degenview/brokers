@@ -21,6 +21,8 @@ use crate::testing::ManualClock;
 pub trait Exchange: Send + Sync {
     fn broker(&self) -> &'static dyn Broker;
     fn credentials(&self) -> Credentials;
+    /// The account (portfolio) those credentials trade in, as the connection will report it.
+    fn account(&self) -> crate::model::types::AccountId;
     fn env(&self, clock: Arc<dyn Clock>) -> crate::adapter::Env;
     /// A valid resting buy order in a market the mock lists.
     fn draft(&self) -> OrderDraft;
@@ -152,7 +154,7 @@ impl<'a> Fixture<'a> {
     fn place(&self) -> String {
         let placed = self
             .runtime
-            .submit(self.exchange.draft())
+            .submit(self.exchange.draft(), self.account())
             .wait()
             .expect("the order is placed");
         let id = placed.order_id.0;
@@ -160,6 +162,15 @@ impl<'a> Fixture<'a> {
             v.order.status == OrderStatus::Open
         });
         id
+    }
+
+    /// The account the runtime trades in (empty until it has connected).
+    fn account(&self) -> crate::model::types::AccountId {
+        self.snapshot()
+            .account
+            .as_ref()
+            .map(|account| account.id.clone())
+            .unwrap_or_default()
     }
 
     fn broker_id(&self) -> crate::model::types::BrokerId {
@@ -365,7 +376,11 @@ fn a_lost_reply_is_reconciled(exchange: &dyn Exchange) {
     let f = Fixture::start(exchange);
     f.wait_live();
     exchange.lose_next_order_reply();
-    let error = f.runtime.submit(exchange.draft()).wait().unwrap_err();
+    let error = f
+        .runtime
+        .submit(exchange.draft(), f.account())
+        .wait()
+        .unwrap_err();
     assert_eq!(error.kind, ErrorKind::OutcomeUnknown, "{error:?}");
     assert_eq!(exchange.order_posts(), 1, "the order was sent once");
     assert_eq!(exchange.orders_created(), 1);
@@ -393,7 +408,11 @@ fn a_refused_order_leaves_nothing_behind(exchange: &dyn Exchange) {
     let f = Fixture::start(exchange);
     f.wait_live();
     exchange.refuse_next_order();
-    let error = f.runtime.submit(exchange.draft()).wait().unwrap_err();
+    let error = f
+        .runtime
+        .submit(exchange.draft(), f.account())
+        .wait()
+        .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Rejected);
     assert!(f.snapshot().pending.is_empty());
     assert!(f.journal.unresolved(f.broker_id()).unwrap().is_empty());
@@ -406,7 +425,7 @@ fn an_invalid_order_is_not_sent(exchange: &dyn Exchange) {
     f.wait_live();
     let error = f
         .runtime
-        .submit(exchange.off_increment_draft())
+        .submit(exchange.off_increment_draft(), f.account())
         .wait()
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Invalid);
@@ -471,7 +490,11 @@ fn a_revoked_key_stops_trading(exchange: &dyn Exchange) {
         unreachable!()
     };
     assert_eq!(error.kind, ErrorKind::Auth);
-    let refused = f.runtime.submit(exchange.draft()).wait().unwrap_err();
+    let refused = f
+        .runtime
+        .submit(exchange.draft(), f.account())
+        .wait()
+        .unwrap_err();
     assert_ne!(refused.kind, ErrorKind::OutcomeUnknown);
     assert_eq!(exchange.order_posts(), 0);
     f.runtime.stop();
@@ -481,7 +504,7 @@ fn a_rate_limit_does_not_resend_an_order(exchange: &dyn Exchange) {
     let f = Fixture::start(exchange);
     f.wait_live();
     exchange.rate_limit_next(1);
-    match f.runtime.submit(exchange.draft()).wait() {
+    match f.runtime.submit(exchange.draft(), f.account()).wait() {
         Err(error) => {
             assert!(
                 matches!(
@@ -512,7 +535,11 @@ fn an_unreadable_journal_blocks_new_orders_but_not_cancels(exchange: &dyn Exchan
         f.snapshot().journal_error.is_some()
     });
     assert!(!f.snapshot().can_send_orders());
-    let error = f.runtime.submit(exchange.draft()).wait().unwrap_err();
+    let error = f
+        .runtime
+        .submit(exchange.draft(), f.account())
+        .wait()
+        .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Invalid);
     assert!(error.to_string().contains("No order was sent"), "{error}");
     assert_eq!(
@@ -551,7 +578,12 @@ fn an_unreadable_journal_at_start_is_reported_not_ignored(exchange: &dyn Exchang
         f.snapshot().journal_error.is_some(),
         "an unreadable record is not an empty one"
     );
-    assert!(f.runtime.submit(exchange.draft()).wait().is_err());
+    assert!(
+        f.runtime
+            .submit(exchange.draft(), f.account())
+            .wait()
+            .is_err()
+    );
     assert_eq!(exchange.order_posts(), 0);
     f.runtime.stop();
 }
@@ -563,7 +595,7 @@ fn an_accepted_order_stays_visible_when_its_record_cannot_be_closed(exchange: &d
     f.journal.fail_to_resolve.store(true, Ordering::SeqCst);
     let placed = f
         .runtime
-        .submit(exchange.draft())
+        .submit(exchange.draft(), f.account())
         .wait()
         .expect("an accepted order is a placed order, whatever the journal says");
     f.wait_order(&placed.order_id.0, "the order to be shown", |_| true);
@@ -599,6 +631,7 @@ fn a_failed_lookup_keeps_the_unconfirmed_order(exchange: &dyn Exchange) {
     journal
         .record(&PendingSubmission {
             broker,
+            account: exchange.account(),
             client_id: client_id.clone(),
             draft: exchange.draft(),
             created_ms: 1_794_225_600_000,
@@ -611,7 +644,11 @@ fn a_failed_lookup_keeps_the_unconfirmed_order(exchange: &dyn Exchange) {
     // The lookup fails (the key stops working): the order may still be live, so it stays listed
     // and recorded. It is not "gone" just because one lookup did not answer.
     exchange.revoke_key();
-    let error = f.runtime.retry(client_id.clone()).wait().unwrap_err();
+    let error = f
+        .runtime
+        .retry(client_id.clone(), f.account())
+        .wait()
+        .unwrap_err();
     assert_ne!(error.kind, ErrorKind::NotFound, "{error:?}");
     assert_eq!(f.snapshot().pending.len(), 1);
     assert_eq!(f.journal.unresolved(broker).unwrap().len(), 1);

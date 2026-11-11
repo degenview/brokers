@@ -14,8 +14,8 @@ use crate::model::pending::{
     MemoryJournal, PendingJournal, PendingSubmission, new_client_order_id,
 };
 use crate::model::types::{
-    BrokerId, ClientOrderId, OrderDraft, OrderId, OrderKind, OrderSize, OrderStatus, ProductId,
-    Side, TimeInForce,
+    AccountId, BrokerId, ClientOrderId, OrderDraft, OrderId, OrderKind, OrderSize, OrderStatus,
+    ProductId, Side, TimeInForce,
 };
 use crate::submit::{self, Reconciled, SETTLE_MS};
 
@@ -192,6 +192,7 @@ fn an_order_the_broker_does_not_list_is_believed_missing_only_after_it_has_had_t
     let journal = MemoryJournal::new();
     let entry = PendingSubmission {
         broker: BrokerId::new("coinbase"),
+        account: AccountId::new("pf-1"),
         client_id: ClientOrderId::new("never-sent"),
         draft: limit_buy(),
         created_ms: NOW,
@@ -293,6 +294,7 @@ fn retrying_looks_first_and_reuses_the_same_client_id() {
     let journal = MemoryJournal::new();
     let entry = PendingSubmission {
         broker: BrokerId::new("coinbase"),
+        account: AccountId::new("pf-1"),
         client_id: ClientOrderId::new("retry-2"),
         draft: limit_buy(),
         created_ms: NOW,
@@ -321,6 +323,7 @@ fn a_broker_without_id_idempotency_is_not_resent_until_the_lookup_settles() {
     let journal = MemoryJournal::new();
     let entry = PendingSubmission {
         broker: BrokerId::new("coinbase"),
+        account: AccountId::new("pf-1"),
         client_id: ClientOrderId::new("careful"),
         draft: limit_buy(),
         created_ms: NOW,
@@ -874,7 +877,7 @@ fn placing_an_order_on_the_sandbox_leaves_no_error_behind() {
         std::thread::sleep(Duration::from_millis(10));
     }
     runtime
-        .submit(limit_buy())
+        .submit(limit_buy(), AccountId::new("sandbox"))
         .wait()
         .expect("the sandbox accepts the order");
     // The lookup right after placing and the retry a second later: a later successful read clears

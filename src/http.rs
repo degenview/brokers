@@ -203,9 +203,10 @@ impl HttpClient {
 
     /// A signed POST with a JSON body that **changes state**. Never retried. A failure to complete
     /// the exchange, a reply that cannot be read, a redirect or any status that is not a clear
-    /// refusal is [`ErrorKind::OutcomeUnknown`]: the broker may have acted. Only 400, 401, 403, 409
-    /// and 422 (and 404/429, which are not treated as proof either way) say anything else, so an
-    /// [`ErrorKind::Invalid`] from a write means that no request left the machine.
+    /// refusal is [`ErrorKind::OutcomeUnknown`]: the broker may have acted. Only 400, 401, 403 and
+    /// 422 (and 404/429, which are not treated as proof either way) say anything else, so an
+    /// [`ErrorKind::Invalid`] from a write means that no request left the machine. A 409 on a
+    /// write is **not** a refusal: it is how a broker may say "that id already exists".
     pub fn post(&self, path: &str, body: &Value) -> Result<Value> {
         self.once("POST", path, &[], Some(body), true)
     }
@@ -350,6 +351,13 @@ impl HttpClient {
             300..=399 => BrokerError::new(
                 ErrorKind::Invalid,
                 "The broker redirected the request, which is refused.",
+            ),
+            // A conflict on a write is not a refusal. Brokers use it for "that client order id
+            // already exists" (the order may be live) and for "the order changed under you", and
+            // none of those says nothing happened. The record of the order stays; a lookup decides.
+            409 if write => BrokerError::new(
+                ErrorKind::OutcomeUnknown,
+                "The broker reported a conflict. The order may or may not have been placed or changed.",
             ),
             400 | 409 | 422 => BrokerError::new(
                 ErrorKind::Rejected,
