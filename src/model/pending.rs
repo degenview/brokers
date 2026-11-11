@@ -9,16 +9,31 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{BrokerId, ClientOrderId, OrderDraft, OrderId};
+use super::types::{AccountId, BrokerId, ClientOrderId, OrderDraft, OrderId};
 use crate::adapter::ClientIdRules;
 
 /// A submission that has been recorded and not yet resolved.
+///
+/// It belongs to **one account** at the broker (a portfolio or sub-account): a client order id is
+/// only looked up, and an order only re-sent, through a credential for that account. A record with
+/// no account (written before records carried one) belongs to no account we can name, so no
+/// session may settle, retry or delete it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PendingSubmission {
     pub broker: BrokerId,
+    #[serde(default)]
+    pub account: AccountId,
     pub client_id: ClientOrderId,
     pub draft: OrderDraft,
     pub created_ms: i64,
+}
+
+impl PendingSubmission {
+    /// Whether a session on `account` may look this submission up, settle it or send it again.
+    /// Never true for a record with no account, nor for an empty `account`.
+    pub fn belongs_to(&self, account: &AccountId) -> bool {
+        !self.account.as_str().is_empty() && &self.account == account
+    }
 }
 
 /// How a submission ended.
@@ -45,19 +60,24 @@ impl std::error::Error for JournalError {}
 pub trait PendingJournal: Send + Sync {
     /// Durably records `entry`. An error means the order **must not be sent**.
     fn record(&self, entry: &PendingSubmission) -> Result<(), JournalError>;
+    /// Closes the record of `client_id` **for `account`**. A record of another account with the
+    /// same client id is left alone.
     fn resolve(
         &self,
         broker: BrokerId,
+        account: &AccountId,
         client_id: &ClientOrderId,
         outcome: &SubmissionOutcome,
     ) -> Result<(), JournalError>;
+    /// Every unresolved record of the broker, **whatever account it belongs to**. The runtime keeps
+    /// to its own account's records; the rest are held untouched.
     fn unresolved(&self, broker: BrokerId) -> Result<Vec<PendingSubmission>, JournalError>;
 }
 
 /// A journal in memory, for tests and for sessions that need none.
 #[derive(Default)]
 pub struct MemoryJournal {
-    entries: Mutex<BTreeMap<(String, String), PendingSubmission>>,
+    entries: Mutex<BTreeMap<(String, String, String), PendingSubmission>>,
     /// Test hook: make `record` fail.
     pub fail_to_record: std::sync::atomic::AtomicBool,
     /// Test hook: make `resolve` fail (the entry stays).
@@ -84,7 +104,11 @@ impl PendingJournal for MemoryJournal {
             .lock()
             .map_err(|_| JournalError("journal poisoned".to_owned()))?
             .insert(
-                (entry.broker.as_str().to_owned(), entry.client_id.0.clone()),
+                (
+                    entry.broker.as_str().to_owned(),
+                    entry.account.0.clone(),
+                    entry.client_id.0.clone(),
+                ),
                 entry.clone(),
             );
         Ok(())
@@ -93,6 +117,7 @@ impl PendingJournal for MemoryJournal {
     fn resolve(
         &self,
         broker: BrokerId,
+        account: &AccountId,
         client_id: &ClientOrderId,
         _outcome: &SubmissionOutcome,
     ) -> Result<(), JournalError> {
@@ -105,7 +130,11 @@ impl PendingJournal for MemoryJournal {
         self.entries
             .lock()
             .map_err(|_| JournalError("journal poisoned".to_owned()))?
-            .remove(&(broker.as_str().to_owned(), client_id.0.clone()));
+            .remove(&(
+                broker.as_str().to_owned(),
+                account.0.clone(),
+                client_id.0.clone(),
+            ));
         Ok(())
     }
 

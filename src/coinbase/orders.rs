@@ -272,6 +272,8 @@ impl CoinbaseConnection {
             best_bid: amount(&response.best_bid),
             best_ask: amount(&response.best_ask),
             problems,
+            // The runtime stamps the order the preview was worked out for.
+            base: None,
         })
     }
 

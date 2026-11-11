@@ -3,7 +3,7 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::types::{OrderId, OrderStatus, ProductId, Side};
+use super::types::{AccountId, LiveOrder, OrderId, OrderSize, OrderStatus, ProductId, Side};
 
 /// A problem the broker found with an order or an edit before it was placed. Shown inline.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -88,6 +88,39 @@ impl OrderChange {
     }
 }
 
+/// The state of an open order that an edit was previewed against. An edit is sent only against the
+/// same state: a fill, an edit made elsewhere or a change of account in between means the figures
+/// the user confirmed describe a different order, so the edit is refused and the order is read
+/// again.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OrderFingerprint {
+    /// The account the order was read in.
+    pub account: AccountId,
+    pub id: OrderId,
+    pub status: Option<OrderStatus>,
+    pub size: Option<OrderSize>,
+    pub filled_size: Decimal,
+    pub limit_price: Option<Decimal>,
+    pub stop_price: Option<Decimal>,
+    pub updated_ms: Option<i64>,
+}
+
+impl OrderFingerprint {
+    /// What `order` looks like in `account` right now.
+    pub fn of(account: &AccountId, order: &LiveOrder) -> Self {
+        Self {
+            account: account.clone(),
+            id: order.id.clone(),
+            status: Some(order.status),
+            size: order.size,
+            filled_size: order.filled_size,
+            limit_price: order.limit_price,
+            stop_price: order.stop_price,
+            updated_ms: order.updated_ms,
+        }
+    }
+}
+
 /// What an edit would do.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EditPreview {
@@ -98,6 +131,8 @@ pub struct EditPreview {
     pub best_bid: Option<Decimal>,
     pub best_ask: Option<Decimal>,
     pub problems: Vec<Problem>,
+    /// The order this was worked out for, as the runtime held it. Pass it back to `amend`.
+    pub base: Option<OrderFingerprint>,
 }
 
 impl EditPreview {

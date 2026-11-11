@@ -46,7 +46,15 @@ pub fn credentials(pem: &str) -> Credentials {
         .with(FIELD_PRIVATE_KEY, pem)
 }
 
-pub const PERMISSIONS: &str = r#"{"can_view":true,"can_trade":true,"can_transfer":false,"portfolio_uuid":"pf-1","portfolio_type":"DEFAULT"}"#;
+/// The portfolio every fake belongs to unless a test says otherwise.
+pub const DEFAULT_PORTFOLIO: &str = "pf-1";
+
+/// What `/key_permissions` says for a key of `portfolio`.
+fn permissions(portfolio: &str, can_trade: bool) -> String {
+    format!(
+        r#"{{"can_view":true,"can_trade":{can_trade},"can_transfer":false,"portfolio_uuid":"{portfolio}","portfolio_type":"DEFAULT"}}"#
+    )
+}
 
 #[derive(Clone, Debug)]
 pub struct FakeOrder {
@@ -84,6 +92,17 @@ pub struct State {
     pub edit_failure: Option<String>,
     /// Read-only mode: `can_trade` false in the key permissions.
     pub view_only_key: bool,
+    /// The portfolio this key belongs to. Empty means [`DEFAULT_PORTFOLIO`]. A second fake with
+    /// another portfolio is a second account: it holds its own orders and sees none of the first's.
+    pub portfolio_uuid: String,
+    /// Create the next order, then answer it with this HTTP status instead of success.
+    pub status_after_create: Option<u16>,
+    /// Answer the next order write (create, cancel or edit) with this HTTP status, doing nothing.
+    pub status_for_next_write: Option<u16>,
+    /// Leave the `time` out of the best-bid-ask answers.
+    pub quote_without_time: bool,
+    /// The `time` of the best-bid-ask answers (RFC 3339). Empty means "now", as a live exchange's.
+    pub quote_time: String,
     /// Answer every lookup of one order by id with the 400 Coinbase's sandbox gives, which does
     /// not keep the orders it is sent.
     pub order_lookup_invalid: bool,
@@ -220,14 +239,12 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
         .unwrap_or("");
     match (request.method.as_str(), path) {
         ("GET", "/key_permissions") => {
-            if state.view_only_key {
-                Reply::json(
-                    200,
-                    r#"{"can_view":true,"can_trade":false,"can_transfer":false,"portfolio_uuid":"pf-1","portfolio_type":"DEFAULT"}"#,
-                )
+            let portfolio = if state.portfolio_uuid.is_empty() {
+                DEFAULT_PORTFOLIO
             } else {
-                Reply::json(200, PERMISSIONS)
-            }
+                state.portfolio_uuid.as_str()
+            };
+            Reply::json(200, permissions(portfolio, !state.view_only_key))
         }
         ("GET", "/accounts") => Reply::json(
             200,
@@ -237,10 +254,34 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
             200,
             r#"{"products":[{"product_id":"BTC-USD","base_currency_id":"BTC","quote_currency_id":"USD","price_increment":"0.01","base_increment":"0.00000001","quote_increment":"0.01","base_min_size":"0.00001","base_max_size":"1000","quote_min_size":"1","quote_max_size":"1000000","status":"online","product_type":"SPOT"}]}"#,
         ),
-        ("GET", "/best_bid_ask") => Reply::json(
+        ("GET", "/best_bid_ask") if state.quote_without_time => Reply::json(
             200,
-            r#"{"pricebooks":[{"product_id":"BTC-USD","bids":[{"price":"89999.50","size":"1"}],"asks":[{"price":"90000.50","size":"1"}],"time":"2026-11-09T12:00:00Z"}]}"#,
+            r#"{"pricebooks":[{"product_id":"BTC-USD","bids":[{"price":"89999.50","size":"1"}],"asks":[{"price":"90000.50","size":"1"}]}]}"#,
         ),
+        ("GET", "/best_bid_ask") => {
+            let time = if state.quote_time.is_empty() {
+                super::time::format_rfc3339_ms(crate::adapter::Clock::now_ms(
+                    &crate::adapter::SystemClock,
+                ))
+            } else {
+                state.quote_time.clone()
+            };
+            Reply::json(
+                200,
+                format!(
+                    r#"{{"pricebooks":[{{"product_id":"BTC-USD","bids":[{{"price":"89999.50","size":"1"}}],"asks":[{{"price":"90000.50","size":"1"}}],"time":"{time}"}}]}}"#
+                ),
+            )
+        }
+        ("POST", "/orders" | "/orders/batch_cancel" | "/orders/edit")
+            if state.status_for_next_write.is_some() =>
+        {
+            let status = state.status_for_next_write.take().unwrap_or(500);
+            Reply::json(
+                status,
+                r#"{"error":"DUPLICATE_CLIENT_ORDER_ID","message":"conflict"}"#,
+            )
+        }
         ("GET", "/transaction_summary") => Reply::json(
             200,
             r#"{"fee_tier":{"pricing_tier":"Advanced 1","maker_fee_rate":"0.004","taker_fee_rate":"0.006"}}"#,
@@ -304,7 +345,12 @@ fn route(state: &mut State, request: &RecordedRequest) -> Reply {
                 "order_id": order.id, "product_id": order.product,
                 "side": order.side, "client_order_id": order.client_id}});
             state.orders.push(order);
-            if state.drop_reply_after_create {
+            if let Some(status) = state.status_after_create.take() {
+                Reply::json(
+                    status,
+                    r#"{"error":"DUPLICATE_CLIENT_ORDER_ID","message":"conflict"}"#,
+                )
+            } else if state.drop_reply_after_create {
                 state.drop_reply_after_create = false;
                 Reply::Drop
             } else if state.garble_create_reply {
@@ -659,6 +705,15 @@ impl crate::testing::conformance::Exchange for CoinbaseExchange {
 
     fn credentials(&self) -> Credentials {
         credentials(&generate_key_pem())
+    }
+
+    fn account(&self) -> crate::model::types::AccountId {
+        let portfolio = self.rest.with_state(|s| s.portfolio_uuid.clone());
+        crate::model::types::AccountId::new(if portfolio.is_empty() {
+            DEFAULT_PORTFOLIO.to_owned()
+        } else {
+            portfolio
+        })
     }
 
     fn env(&self, clock: Arc<dyn crate::adapter::Clock>) -> crate::adapter::Env {

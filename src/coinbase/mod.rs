@@ -143,6 +143,9 @@ mod tests {
 }
 
 #[cfg(test)]
+mod account_tests;
+
+#[cfg(test)]
 mod orders_tests;
 
 #[cfg(test)]

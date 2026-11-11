@@ -23,17 +23,21 @@ use crate::model::capabilities::Capabilities;
 use crate::model::events::{EventSink, StreamEvent};
 use crate::model::orders::{
     CancelOutcome, CancelResult, EditOutcome, EditPreview, FeeSummary, FillFilter, HistoryFilter,
-    OrderChange, OrderPreview, Page, PlacedOrder,
+    OrderChange, OrderFingerprint, OrderPreview, Page, PlacedOrder,
 };
 use crate::model::pending::{PendingJournal, PendingSubmission, new_client_order_id};
 use crate::model::reducer::{Book, Notice, OrderView, Source};
 use crate::model::types::{
-    AccountId, Balance, BrokerId, ClientOrderId, LiveFill, LiveOrder, OrderDraft, OrderId,
-    ProductId, ProductSpec, Quote,
+    AccountId, AccountRef, Balance, BrokerId, ClientOrderId, LiveFill, LiveOrder, OrderDraft,
+    OrderId, ProductId, ProductSpec, Quote,
 };
 use crate::model::validate::validate_draft;
 use crate::secret::Credentials;
 use crate::submit;
+
+/// Each runtime started in this process gets the next number, so an interface can tell a runtime
+/// that replaced another from one that is merely the same broker again.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Asked to redraw. Called from the worker thread; must not block.
 pub trait Waker: Send + Sync {
@@ -136,9 +140,18 @@ pub struct PendingView {
 pub struct BrokerSnapshot {
     /// Rises whenever anything here changes.
     pub revision: u64,
+    /// Which runtime this is: unique in the process, and never reused. A preview, a quote or a
+    /// confirmation made against one generation says nothing about the next.
+    pub generation: u64,
     pub broker: BrokerId,
     pub status: Status,
     pub session: Option<Session>,
+    /// The account this runtime trades in, once connected. Every order sent, previewed or edited
+    /// through it is for this account and no other.
+    pub account: Option<AccountRef>,
+    /// Unconfirmed orders in the journal that belong to another account (or to none we can name).
+    /// They are never looked up, settled or sent again from here; they wait for their own account.
+    pub held_elsewhere: usize,
     pub balances: Vec<Balance>,
     pub balances_ms: Option<i64>,
     pub orders: Vec<OrderView>,
@@ -161,9 +174,12 @@ impl BrokerSnapshot {
     fn empty(broker: BrokerId) -> Self {
         Self {
             revision: 0,
+            generation: 0,
             broker,
             status: Status::Connecting,
             session: None,
+            account: None,
+            held_elsewhere: 0,
             balances: Vec::new(),
             balances_ms: None,
             orders: Vec::new(),
@@ -232,12 +248,17 @@ impl<T> Pending<T> {
 type Reply<T> = Sender<Result<T>>;
 
 enum Command {
-    Submit(OrderDraft, Reply<PlacedOrder>),
-    Retry(ClientOrderId, Reply<PlacedOrder>),
-    Preview(OrderDraft, Reply<OrderPreview>),
+    Submit(OrderDraft, AccountId, Reply<PlacedOrder>),
+    Retry(ClientOrderId, AccountId, Reply<PlacedOrder>),
+    Preview(OrderDraft, AccountId, Reply<OrderPreview>),
     Cancel(Vec<OrderId>, Reply<Vec<CancelResult>>),
     PreviewEdit(OrderId, OrderChange, Reply<EditPreview>),
-    Amend(OrderId, OrderChange, Reply<EditOutcome>),
+    Amend(
+        OrderId,
+        OrderChange,
+        Box<OrderFingerprint>,
+        Reply<EditOutcome>,
+    ),
     History(HistoryFilter, Option<String>, Reply<Page<LiveOrder>>),
     Fills(FillFilter, Option<String>, Reply<Page<LiveFill>>),
     Quote(ProductId, Reply<Quote>),
@@ -262,6 +283,7 @@ impl EventSink for ForwardSink {
 struct Shared {
     snapshot: RwLock<Arc<BrokerSnapshot>>,
     revision: AtomicU64,
+    generation: u64,
 }
 
 pub struct BrokerRuntime {
@@ -278,9 +300,15 @@ impl BrokerRuntime {
         config: RuntimeConfig,
     ) -> Self {
         let id = broker.descriptor().id;
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
         let shared = Arc::new(Shared {
-            snapshot: RwLock::new(Arc::new(BrokerSnapshot::empty(id))),
+            snapshot: RwLock::new(Arc::new({
+                let mut snapshot = BrokerSnapshot::empty(id);
+                snapshot.generation = generation;
+                snapshot
+            })),
             revision: AtomicU64::new(0),
+            generation,
         });
         let (sender, receiver) = mpsc::channel();
         let worker = Worker::new(
@@ -316,19 +344,30 @@ impl BrokerRuntime {
         Pending(receiver)
     }
 
-    /// Validates, records and sends an order. See [`crate::submit`] for what the answer means; an
-    /// `OutcomeUnknown` error means the order is shown as unconfirmed until it is looked up.
-    pub fn submit(&self, draft: OrderDraft) -> Pending<PlacedOrder> {
-        self.ask(|reply| Command::Submit(draft, reply))
+    /// Which runtime this is. See [`BrokerSnapshot::generation`].
+    pub fn generation(&self) -> u64 {
+        self.shared.generation
+    }
+
+    /// Validates, records and sends an order **for `account`**. If this runtime trades in another
+    /// account (the credential was replaced since the order was reviewed) nothing is recorded or
+    /// sent, and the answer is an `Invalid` error. See [`crate::submit`] for what the answer
+    /// means; an `OutcomeUnknown` error means the order is shown as unconfirmed until it is looked
+    /// up.
+    pub fn submit(&self, draft: OrderDraft, account: AccountId) -> Pending<PlacedOrder> {
+        self.ask(|reply| Command::Submit(draft, account, reply))
     }
 
     /// Sends an unconfirmed submission again, under its original client id, after looking first.
-    pub fn retry(&self, client_id: ClientOrderId) -> Pending<PlacedOrder> {
-        self.ask(|reply| Command::Retry(client_id, reply))
+    /// Refused unless `account` is this runtime's account and the submission is its own.
+    pub fn retry(&self, client_id: ClientOrderId, account: AccountId) -> Pending<PlacedOrder> {
+        self.ask(|reply| Command::Retry(client_id, account, reply))
     }
 
-    pub fn preview(&self, draft: OrderDraft) -> Pending<OrderPreview> {
-        self.ask(|reply| Command::Preview(draft, reply))
+    /// What the broker says an order would do, asked **for `account`**: refused if this runtime
+    /// trades in another.
+    pub fn preview(&self, draft: OrderDraft, account: AccountId) -> Pending<OrderPreview> {
+        self.ask(|reply| Command::Preview(draft, account, reply))
     }
 
     pub fn cancel(&self, orders: Vec<OrderId>) -> Pending<Vec<CancelResult>> {
@@ -339,8 +378,16 @@ impl BrokerRuntime {
         self.ask(|reply| Command::PreviewEdit(order, change, reply))
     }
 
-    pub fn amend(&self, order: OrderId, change: OrderChange) -> Pending<EditOutcome> {
-        self.ask(|reply| Command::Amend(order, change, reply))
+    /// Changes an open order, but only if it is still the order that was previewed: `base` is the
+    /// [`EditPreview::base`] the user confirmed. If the order (or the account) has changed since,
+    /// nothing is sent, the order is read again, and the answer is an `Invalid` error.
+    pub fn amend(
+        &self,
+        order: OrderId,
+        change: OrderChange,
+        base: OrderFingerprint,
+    ) -> Pending<EditOutcome> {
+        self.ask(|reply| Command::Amend(order, change, Box::new(base), reply))
     }
 
     pub fn history(
@@ -473,17 +520,11 @@ impl Worker {
     ) -> Self {
         let now = config.env.clock.now_ms();
         let id = broker.descriptor().id;
-        let mut pending = BTreeMap::new();
-        let mut journal_error = None;
-        match config.journal.unresolved(id) {
-            Ok(entries) => {
-                for entry in entries {
-                    pending.insert(entry.client_id.0.clone(), unknown_view(entry));
-                }
-            }
-            // Not "nothing pending": orders that may be live are in there somewhere.
-            Err(error) => journal_error = Some(journal_unreadable(&error)),
-        }
+        // The journal is not read here: whose records are ours depends on the account, which is
+        // known only once connected (see `load_pending`), and reading it can wait on the store.
+        let pending = BTreeMap::new();
+        let journal_error = None;
+        let generation = shared.generation;
         Self {
             broker,
             credentials: Some(credentials),
@@ -495,7 +536,7 @@ impl Worker {
             book: Book::new(),
             snapshot: {
                 let mut snapshot = BrokerSnapshot::empty(id);
-                snapshot.journal_error.clone_from(&journal_error);
+                snapshot.generation = generation;
                 snapshot
             },
             catalogue: HashMap::new(),
@@ -643,6 +684,7 @@ impl Worker {
         match self.broker.connect(&credentials, &self.config.env) {
             Ok(connection) => {
                 self.snapshot.session = Some(connection.session().clone());
+                self.snapshot.account = connection.session().accounts.first().cloned();
                 self.snapshot.last_error = None;
                 let sink = Arc::new(ForwardSink(self.sender.clone()));
                 match connection.open_stream(sink) {
@@ -655,6 +697,8 @@ impl Worker {
                 self.connect_failures = 0;
                 self.needs_resync = true;
                 self.dirty = true;
+                // Now the account is known, the journal can be read for it.
+                self.load_pending();
             }
             Err(error) => {
                 self.note_error(&error);
@@ -876,20 +920,73 @@ impl Worker {
         }
     }
 
+    /// The account this runtime trades in: the first account of the session it connected with.
+    /// `None` until connected, and for a session that names none.
+    fn account(&self) -> Option<AccountId> {
+        self.snapshot
+            .account
+            .as_ref()
+            .map(|account| account.id.clone())
+            .filter(|id| !id.as_str().is_empty())
+    }
+
+    /// Refuses a request made for another account than this runtime's. Checked before anything is
+    /// recorded or sent, so the interface's idea of "the account" can never reach a different one.
+    fn expect_account(&self, expected: &AccountId) -> Result<()> {
+        match self.account() {
+            None => Err(Self::not_connected()),
+            Some(account) if &account == expected => Ok(()),
+            Some(_) => Err(BrokerError::new(
+                ErrorKind::Invalid,
+                "The account changed since this was set up. Nothing was sent. Check the order again.",
+            )),
+        }
+    }
+
+    /// This account's unresolved records. Records of any other account, and records of none, are
+    /// counted in [`BrokerSnapshot::held_elsewhere`] and otherwise left alone: not shown as ours,
+    /// not looked up, not settled, not sent again. `None` if the journal cannot be read (the error
+    /// is published) or there is no account to read it for.
+    fn own_records(&mut self) -> Option<Vec<PendingSubmission>> {
+        let account = self.account()?;
+        let id = self.broker.descriptor().id;
+        match self.config.journal.unresolved(id) {
+            Ok(entries) => {
+                self.set_journal_error(None);
+                let (own, other): (Vec<_>, Vec<_>) = entries
+                    .into_iter()
+                    .partition(|entry| entry.belongs_to(&account));
+                if self.snapshot.held_elsewhere != other.len() {
+                    self.snapshot.held_elsewhere = other.len();
+                    self.dirty = true;
+                }
+                Some(own)
+            }
+            Err(error) => {
+                self.set_journal_error(Some(journal_unreadable(&error)));
+                None
+            }
+        }
+    }
+
+    /// Shows this account's unconfirmed orders. Called once connected.
+    fn load_pending(&mut self) {
+        if let Some(entries) = self.own_records() {
+            for entry in entries {
+                self.pending
+                    .entry(entry.client_id.0.clone())
+                    .or_insert_with(|| unknown_view(entry));
+                self.dirty = true;
+            }
+        }
+    }
+
     fn reconcile_pending(&mut self) {
         let Some(connection) = self.connection.clone() else {
             return;
         };
-        let id = self.broker.descriptor().id;
-        let entries = match self.config.journal.unresolved(id) {
-            Ok(entries) => {
-                self.set_journal_error(None);
-                entries
-            }
-            Err(error) => {
-                self.set_journal_error(Some(journal_unreadable(&error)));
-                return;
-            }
+        let Some(entries) = self.own_records() else {
+            return;
         };
         // Entries the journal holds that nothing on screen shows (it was unreadable at the start,
         // or an answer was lost) are shown again, as unconfirmed.
@@ -946,13 +1043,10 @@ impl Worker {
     /// journal no longer holds it. If the journal still has it, or cannot be read, the order may
     /// be live and it stays, as unconfirmed.
     fn settle_view(&mut self, client_id: &ClientOrderId) {
-        let id = self.broker.descriptor().id;
-        let held = match self.config.journal.unresolved(id) {
-            Ok(entries) => entries.iter().any(|entry| &entry.client_id == client_id),
-            Err(error) => {
-                self.set_journal_error(Some(journal_unreadable(&error)));
-                true
-            }
+        let held = match self.own_records() {
+            Some(entries) => entries.iter().any(|entry| &entry.client_id == client_id),
+            // Unreadable (or no account to read it for): the order may be live, so it stays.
+            None => true,
         };
         if held {
             if let Some(view) = self.pending.get_mut(&client_id.0) {
@@ -1033,16 +1127,22 @@ impl Worker {
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::Submit(draft, reply) => {
-                let result = self.submit(draft);
+            Command::Submit(draft, account, reply) => {
+                let result = self
+                    .expect_account(&account)
+                    .and_then(|()| self.submit(draft));
                 self.answer(&reply, result);
             }
-            Command::Retry(client_id, reply) => {
-                let result = self.retry(&client_id);
+            Command::Retry(client_id, account, reply) => {
+                let result = self
+                    .expect_account(&account)
+                    .and_then(|()| self.retry(&client_id));
                 self.answer(&reply, result);
             }
-            Command::Preview(draft, reply) => {
-                let result = self.with_connection(|c| c.preview(&draft));
+            Command::Preview(draft, account, reply) => {
+                let result = self
+                    .expect_account(&account)
+                    .and_then(|()| self.with_connection(|c| c.preview(&draft)));
                 self.answer(&reply, result);
             }
             Command::Cancel(ids, reply) => {
@@ -1050,17 +1150,26 @@ impl Worker {
                 self.answer(&reply, result);
             }
             Command::PreviewEdit(id, change, reply) => {
-                let result = match self.book.get(&id).cloned() {
-                    Some(order) => self.with_connection(|c| c.preview_edit(&order, &change)),
-                    None => Err(BrokerError::new(
+                let account = self.account();
+                let result = match (self.book.get(&id).cloned(), account) {
+                    (Some(order), Some(account)) => {
+                        let base = OrderFingerprint::of(&account, &order);
+                        self.with_connection(|c| c.preview_edit(&order, &change))
+                            .map(|preview| EditPreview {
+                                base: Some(base),
+                                ..preview
+                            })
+                    }
+                    (None, _) => Err(BrokerError::new(
                         ErrorKind::NotFound,
                         "That order is not open.",
                     )),
+                    (Some(_), None) => Err(Self::not_connected()),
                 };
                 self.answer(&reply, result);
             }
-            Command::Amend(id, change, reply) => {
-                let result = self.amend(&id, &change);
+            Command::Amend(id, change, base, reply) => {
+                let result = self.amend(&id, &change, &base);
                 self.answer(&reply, result);
             }
             Command::History(filter, cursor, reply) => {
@@ -1286,12 +1395,29 @@ impl Worker {
         Ok(results)
     }
 
-    fn amend(&mut self, id: &OrderId, change: &OrderChange) -> Result<EditOutcome> {
+    fn amend(
+        &mut self,
+        id: &OrderId,
+        change: &OrderChange,
+        base: &OrderFingerprint,
+    ) -> Result<EditOutcome> {
+        self.expect_account(&base.account)?;
         let order = self
             .book
             .get(id)
             .cloned()
             .ok_or_else(|| BrokerError::new(ErrorKind::NotFound, "That order is not open."))?;
+        // The edit re-sends every figure of the order as we hold it. If what we hold is not what
+        // was reviewed (a fill, an edit made elsewhere), the reviewed figures describe another
+        // order: nothing is sent, and the order is read again so the next review is of the real one.
+        if &OrderFingerprint::of(&base.account, &order) != base {
+            self.schedule_refetch(id.clone(), 0);
+            self.dirty = true;
+            return Err(BrokerError::new(
+                ErrorKind::Invalid,
+                "The order changed since you reviewed it. Nothing was sent. Review the change again.",
+            ));
+        }
         let now = self.now();
         let result = self.with_connection(|c| c.amend(&order, change));
         match &result {

@@ -44,6 +44,11 @@ after it, re-read after gaps, sleep and unknown outcomes), the submit/reconcile 
 journal, validation against product rules, redacted credentials, and the HTTP client's retry and
 no-redirect rules.
 
+The first account of the `Session` your connection returns is the account every journal entry is
+scoped to, so its id must be non-empty and the same for the same credential every time (a
+portfolio id, not a random one); `Exchange::account` in the conformance suite must return it. A
+broker with one account per credential still names it.
+
 ## What not to build
 
 Transfers, withdrawals, deposits or conversions. Cancel-and-replace presented as an edit. An
