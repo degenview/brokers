@@ -48,5 +48,42 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
     market_source: "coinbase",
     account_model: AccountModel::Portfolios,
     // Coinbase's private-endpoint limits are not documented; stay well under any plausible one.
+    real_money: true,
     min_request_gap_ms: 120,
 };
+
+pub const SANDBOX_ID: BrokerId = BrokerId::new("coinbase-sandbox");
+
+/// Coinbase's sandbox: the same orders API on another host, answering with canned data and asking
+/// for no key at all. A broker in its own right, so it never touches a real account by mistake.
+pub static SANDBOX_DESCRIPTOR: Descriptor = Descriptor {
+    id: SANDBOX_ID,
+    display_name: "Coinbase Sandbox",
+    credential_fields: &[],
+    setup_steps: &[
+        "There is nothing to create: Coinbase's sandbox needs no API key.",
+        "Its answers are fixed examples. The balances, orders and fills do not change when you place, edit or cancel an order, and it has no live prices.",
+        "Use it to try the order ticket and its previews without a real account. Nothing here reaches your Coinbase account.",
+    ],
+    permission_note: "No key is used, so there is nothing to grant. Press Connect.",
+    docs_url: "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/sandbox",
+    client_id: ClientIdRules {
+        max_len: 128,
+        idempotent: true,
+    },
+    market_source: "coinbase",
+    account_model: AccountModel::Portfolios,
+    real_money: false,
+    min_request_gap_ms: 120,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_sandbox_is_not_real_money() {
+        assert!(DESCRIPTOR.real_money);
+        assert!(!SANDBOX_DESCRIPTOR.real_money);
+    }
+}

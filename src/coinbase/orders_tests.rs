@@ -806,3 +806,87 @@ fn a_broker_that_cannot_preview_says_so_and_places_nothing() {
     fake.with_state(|s| s.fail_preview = false);
     assert!(connection.preview(&limit_buy()).unwrap().is_acceptable());
 }
+
+fn connect_sandbox(fake: &FakeCoinbase) -> Box<dyn Connection> {
+    super::CoinbaseSandbox
+        .connect(
+            &crate::secret::Credentials::new(),
+            &Env::default().with_loopback_base_url(fake.url()),
+        )
+        .expect("connect to the fake sandbox")
+}
+
+#[test]
+fn the_sandbox_cannot_look_up_an_order_it_just_accepted_and_says_not_found() {
+    let fake = FakeCoinbase::start();
+    fake.with_state(|state| state.order_lookup_invalid = true);
+    let connection = connect_sandbox(&fake);
+    let placed = connection
+        .place(&limit_buy(), &ClientOrderId::new("sandbox-1"))
+        .expect("the sandbox accepts the order");
+    let error = connection.order(&placed.order_id).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::NotFound, "{error}");
+    assert!(!error.to_string().contains("{order_id}"), "{error}");
+    // The real service's 400 on a lookup is still a rejection, not hidden.
+    fake.with_state(|state| state.order_lookup_invalid = true);
+    let real = connect(&fake);
+    assert_eq!(
+        real.order(&placed.order_id).unwrap_err().kind,
+        ErrorKind::Rejected
+    );
+}
+
+#[test]
+fn placing_an_order_on_the_sandbox_leaves_no_error_behind() {
+    use crate::model::reducer::Notice;
+    use crate::runtime::{BrokerRuntime, NoticeSink, RuntimeConfig, Waker};
+    use std::sync::Arc;
+    struct Quiet;
+    impl Waker for Quiet {
+        fn wake(&self) {}
+    }
+    impl NoticeSink for Quiet {
+        fn notice(&self, _: Notice) {}
+    }
+    let fake = FakeCoinbase::start();
+    fake.with_state(|state| state.order_lookup_invalid = true);
+    let env = Env::default()
+        .with_loopback_base_url(fake.url())
+        .with_request_gap(Duration::from_millis(1));
+    let config = RuntimeConfig::new(
+        env,
+        Arc::new(MemoryJournal::new()),
+        Arc::new(Quiet),
+        Arc::new(Quiet),
+    )
+    .fast();
+    let runtime = BrokerRuntime::start(
+        &super::CoinbaseSandbox,
+        crate::secret::Credentials::new(),
+        config,
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !runtime.snapshot().is_live() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sandbox goes live"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    runtime
+        .submit(limit_buy())
+        .wait()
+        .expect("the sandbox accepts the order");
+    // The lookup right after placing and the retry a second later: a later successful read clears
+    // an error, so every snapshot in between is looked at, not just the last.
+    let until = std::time::Instant::now() + Duration::from_millis(1_800);
+    while std::time::Instant::now() < until {
+        assert_eq!(
+            runtime.snapshot().last_error,
+            None,
+            "an accepted order is not an error"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    runtime.stop();
+}

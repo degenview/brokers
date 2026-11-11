@@ -80,6 +80,9 @@ pub struct Descriptor {
     /// it). A chart from any other source is not tradable here.
     pub market_source: &'static str,
     pub account_model: AccountModel,
+    /// Whether orders sent here move real money. `false` for a test environment (a sandbox), so
+    /// the interface does not call it live.
+    pub real_money: bool,
     /// The smallest gap between two requests to this broker's private endpoints.
     pub min_request_gap_ms: u64,
 }
@@ -412,6 +415,7 @@ mod tests {
             },
             market_source: "test",
             account_model: AccountModel::Flat,
+            real_money: true,
             min_request_gap_ms: 100,
         }
     }
