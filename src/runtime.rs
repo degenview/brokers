@@ -13,11 +13,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::adapter::{Broker, Connection, Env, Session, StreamHandle};
+use crate::adapter::{Broker, Clock, Connection, Env, Session, StreamHandle};
 use crate::error::{BrokerError, ErrorKind, Result};
 use crate::model::capabilities::Capabilities;
 use crate::model::events::{EventSink, StreamEvent};
@@ -26,6 +26,7 @@ use crate::model::orders::{
     OrderChange, OrderFingerprint, OrderPreview, Page, PlacedOrder,
 };
 use crate::model::pending::{PendingJournal, PendingSubmission, new_client_order_id};
+use crate::model::quotes::QuoteBoard;
 use crate::model::reducer::{Book, Notice, OrderView, Source};
 use crate::model::types::{
     AccountId, AccountRef, Balance, BrokerId, ClientOrderId, LiveFill, LiveOrder, OrderDraft,
@@ -286,10 +287,19 @@ struct Shared {
     generation: u64,
 }
 
+/// The markets wanted at this connection and the reads in flight for them.
+#[derive(Default)]
+struct QuotePump {
+    board: QuoteBoard,
+    out: HashMap<ProductId, Pending<Quote>>,
+}
+
 pub struct BrokerRuntime {
     shared: Arc<Shared>,
     sender: Sender<Message>,
     thread: Option<JoinHandle<()>>,
+    clock: Arc<dyn Clock>,
+    quotes: Mutex<QuotePump>,
 }
 
 impl BrokerRuntime {
@@ -310,6 +320,7 @@ impl BrokerRuntime {
             revision: AtomicU64::new(0),
             generation,
         });
+        let clock = Arc::clone(&config.env.clock);
         let (sender, receiver) = mpsc::channel();
         let worker = Worker::new(
             broker,
@@ -326,6 +337,8 @@ impl BrokerRuntime {
             shared,
             sender,
             thread: Some(thread),
+            clock,
+            quotes: Mutex::new(QuotePump::default()),
         }
     }
 
@@ -404,6 +417,55 @@ impl BrokerRuntime {
 
     pub fn quote(&self, product: ProductId) -> Pending<Quote> {
         self.ask(|reply| Command::Quote(product, reply))
+    }
+
+    /// Says that something on screen wants this market's best prices. Cheap; call it every frame
+    /// the prices are drawn. They are then read every couple of seconds (see
+    /// [`crate::model::quotes`]) by [`BrokerRuntime::tick_quotes`], and not at all once this stops.
+    pub fn want_quote(&self, product: &ProductId) {
+        self.pump().board.want(product, Instant::now());
+    }
+
+    /// The market's best prices, when they are fresh by both clocks. A price that is too old is
+    /// `None`, never shown as if it were current.
+    pub fn fresh_quote(&self, product: &ProductId) -> Option<Quote> {
+        self.pump()
+            .board
+            .fresh(product, Instant::now(), self.clock.now_ms())
+    }
+
+    /// Takes the prices that arrived and asks for the ones wanted. Call it once a frame; it never
+    /// waits, a request is a message to the worker and its answer is picked up next time. Returns
+    /// whether a price on show changed, so the caller can ask for a redraw.
+    pub fn tick_quotes(&self) -> bool {
+        let now = Instant::now();
+        let wall_ms = self.clock.now_ms();
+        let live = self.snapshot().is_live();
+        let mut pump = self.pump();
+        let pump = &mut *pump;
+        let mut changed = false;
+        let mut answered = Vec::new();
+        for (product, pending) in &pump.out {
+            if let Some(answer) = pending.poll() {
+                answered.push((product.clone(), answer.ok()));
+            }
+        }
+        for (product, answer) in answered {
+            pump.out.remove(&product);
+            changed |= pump.board.answered(&product, answer, now, wall_ms);
+        }
+        if live {
+            for product in pump.board.due(now) {
+                let pending = self.quote(product.clone());
+                pump.out.insert(product, pending);
+            }
+        }
+        pump.board.forget_idle(now);
+        changed
+    }
+
+    fn pump(&self) -> std::sync::MutexGuard<'_, QuotePump> {
+        self.quotes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// One market's rules, fresh from the broker (and remembered).
