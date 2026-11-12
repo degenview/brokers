@@ -13,19 +13,20 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::adapter::{Broker, Connection, Env, Session, StreamHandle};
+use crate::adapter::{Broker, Clock, Connection, Env, Session, StreamHandle};
 use crate::error::{BrokerError, ErrorKind, Result};
 use crate::model::capabilities::Capabilities;
 use crate::model::events::{EventSink, StreamEvent};
 use crate::model::orders::{
-    CancelOutcome, CancelResult, EditOutcome, EditPreview, FeeSummary, FillFilter, HistoryFilter,
-    OrderChange, OrderFingerprint, OrderPreview, Page, PlacedOrder,
+    CancelOutcome, CancelResult, EditOutcome, EditPreview, EditWorld, FeeSummary, FillFilter,
+    HistoryFilter, OrderChange, OrderFingerprint, OrderPreview, Page, PlacedOrder,
 };
 use crate::model::pending::{PendingJournal, PendingSubmission, new_client_order_id};
+use crate::model::quotes::QuoteBoard;
 use crate::model::reducer::{Book, Notice, OrderView, Source};
 use crate::model::types::{
     AccountId, AccountRef, Balance, BrokerId, ClientOrderId, LiveFill, LiveOrder, OrderDraft,
@@ -202,6 +203,25 @@ impl BrokerSnapshot {
         self.capabilities.get(id)
     }
 
+    /// The order with this id, with the account, connection and market rules an edit of it is read
+    /// against. The order is `None` when it is not in the book.
+    pub fn edit_world(&self, order: &OrderId) -> EditWorld {
+        let order = self
+            .orders
+            .iter()
+            .find(|view| &view.order.id == order)
+            .map(|view| view.order.clone());
+        EditWorld {
+            spec: order
+                .as_ref()
+                .and_then(|order| self.product(&order.product))
+                .cloned(),
+            order,
+            account: self.account.as_ref().map(|account| account.id.clone()),
+            generation: self.generation,
+        }
+    }
+
     pub fn working_orders(&self) -> impl Iterator<Item = &OrderView> {
         self.orders.iter().filter(|v| v.order.status.is_working())
     }
@@ -298,10 +318,19 @@ struct Shared {
     generation: u64,
 }
 
+/// The markets wanted at this connection and the reads in flight for them.
+#[derive(Default)]
+struct QuotePump {
+    board: QuoteBoard,
+    out: HashMap<ProductId, Pending<Quote>>,
+}
+
 pub struct BrokerRuntime {
     shared: Arc<Shared>,
     sender: Sender<Message>,
     thread: Option<JoinHandle<()>>,
+    clock: Arc<dyn Clock>,
+    quotes: Mutex<QuotePump>,
 }
 
 impl BrokerRuntime {
@@ -322,6 +351,7 @@ impl BrokerRuntime {
             revision: AtomicU64::new(0),
             generation,
         });
+        let clock = Arc::clone(&config.env.clock);
         let (sender, receiver) = mpsc::channel();
         let worker = Worker::new(
             broker,
@@ -338,6 +368,8 @@ impl BrokerRuntime {
             shared,
             sender,
             thread: Some(thread),
+            clock,
+            quotes: Mutex::new(QuotePump::default()),
         }
     }
 
@@ -416,6 +448,55 @@ impl BrokerRuntime {
 
     pub fn quote(&self, product: ProductId) -> Pending<Quote> {
         self.ask(|reply| Command::Quote(product, reply))
+    }
+
+    /// Says that something on screen wants this market's best prices. Cheap; call it every frame
+    /// the prices are drawn. They are then read every couple of seconds (see
+    /// [`crate::model::quotes`]) by [`BrokerRuntime::tick_quotes`], and not at all once this stops.
+    pub fn want_quote(&self, product: &ProductId) {
+        self.pump().board.want(product, Instant::now());
+    }
+
+    /// The market's best prices, when they are fresh by both clocks. A price that is too old is
+    /// `None`, never shown as if it were current.
+    pub fn fresh_quote(&self, product: &ProductId) -> Option<Quote> {
+        self.pump()
+            .board
+            .fresh(product, Instant::now(), self.clock.now_ms())
+    }
+
+    /// Takes the prices that arrived and asks for the ones wanted. Call it once a frame; it never
+    /// waits, a request is a message to the worker and its answer is picked up next time. Returns
+    /// whether a price on show changed, so the caller can ask for a redraw.
+    pub fn tick_quotes(&self) -> bool {
+        let now = Instant::now();
+        let wall_ms = self.clock.now_ms();
+        let live = self.snapshot().is_live();
+        let mut pump = self.pump();
+        let pump = &mut *pump;
+        let mut changed = false;
+        let mut answered = Vec::new();
+        for (product, pending) in &pump.out {
+            if let Some(answer) = pending.poll() {
+                answered.push((product.clone(), answer.ok()));
+            }
+        }
+        for (product, answer) in answered {
+            pump.out.remove(&product);
+            changed |= pump.board.answered(&product, answer, now, wall_ms);
+        }
+        if live {
+            for product in pump.board.due(now) {
+                let pending = self.quote(product.clone());
+                pump.out.insert(product, pending);
+            }
+        }
+        pump.board.forget_idle(now);
+        changed
+    }
+
+    fn pump(&self) -> std::sync::MutexGuard<'_, QuotePump> {
+        self.quotes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// One market's rules, fresh from the broker (and remembered).
@@ -1462,4 +1543,100 @@ pub fn balances_of<'a>(
         .balances
         .iter()
         .filter(move |b| &b.account == account)
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_decimal::Decimal;
+
+    use super::*;
+    use crate::model::types::{AccountKind, OrderSize, OrderStatus, OrderType, Restrictions, Side};
+
+    fn d(text: &str) -> Decimal {
+        text.parse().unwrap()
+    }
+
+    fn order(id: &str) -> LiveOrder {
+        LiveOrder {
+            id: OrderId::new(id),
+            client_id: None,
+            product: ProductId::new("BTC-USD"),
+            side: Side::Sell,
+            order_type: OrderType::Limit,
+            status: OrderStatus::Open,
+            tif: None,
+            size: Some(OrderSize::Base(d("1"))),
+            limit_price: Some(d("100")),
+            stop_price: None,
+            stop_direction: None,
+            post_only: false,
+            filled_size: d("0"),
+            filled_value: d("0"),
+            average_price: None,
+            fees: d("0"),
+            created_ms: Some(0),
+            updated_ms: None,
+            reason: None,
+            stop_triggered: false,
+        }
+    }
+
+    fn spec() -> ProductSpec {
+        ProductSpec {
+            id: ProductId::new("BTC-USD"),
+            base: "BTC".to_owned(),
+            quote: "USD".to_owned(),
+            display_name: "BTC-USD".to_owned(),
+            price_increment: d("0.01"),
+            base_increment: d("0.001"),
+            quote_increment: d("0.01"),
+            base_min: d("0.01"),
+            base_max: None,
+            quote_min: d("1"),
+            quote_max: None,
+            restrictions: Restrictions::default(),
+            fetched_ms: 0,
+        }
+    }
+
+    fn snapshot() -> BrokerSnapshot {
+        let mut snapshot = BrokerSnapshot::empty(BrokerId::new("test"));
+        snapshot.generation = 7;
+        snapshot.account = Some(AccountRef {
+            id: AccountId::new("acct"),
+            label: "Main".to_owned(),
+            kind: AccountKind::Spot,
+        });
+        snapshot.products = Arc::new(vec![spec()]);
+        snapshot.orders = vec![OrderView {
+            order: order("o-1"),
+            overlay: None,
+        }];
+        snapshot
+    }
+
+    #[test]
+    fn an_edit_world_holds_the_order_its_account_its_connection_and_its_markets_rules() {
+        let world = snapshot().edit_world(&OrderId::new("o-1"));
+        assert_eq!(world.order, Some(order("o-1")));
+        assert_eq!(world.account, Some(AccountId::new("acct")));
+        assert_eq!(world.generation, 7);
+        assert_eq!(world.spec, Some(spec()));
+    }
+
+    #[test]
+    fn an_order_that_is_not_in_the_book_has_no_world_but_still_names_the_account() {
+        let world = snapshot().edit_world(&OrderId::new("gone"));
+        assert_eq!(world.order, None);
+        assert_eq!(world.spec, None);
+        assert_eq!(world.account, Some(AccountId::new("acct")));
+        assert_eq!(world.generation, 7);
+    }
+
+    #[test]
+    fn without_an_account_the_world_names_none() {
+        let mut snapshot = snapshot();
+        snapshot.account = None;
+        assert_eq!(snapshot.edit_world(&OrderId::new("o-1")).account, None);
+    }
 }
