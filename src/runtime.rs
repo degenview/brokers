@@ -301,6 +301,18 @@ impl BrokerSnapshot {
 pub struct Pending<T>(Receiver<Result<T>>);
 
 impl<T> Pending<T> {
+    #[cfg(test)]
+    pub(crate) fn from_receiver(receiver: Receiver<Result<T>>) -> Self {
+        Self(receiver)
+    }
+
+    /// A request that is already answered: for an interface that has nothing to ask, and for tests.
+    pub fn ready(result: Result<T>) -> Self {
+        let (reply, receiver) = mpsc::channel();
+        let _ = reply.send(result);
+        Self(receiver)
+    }
+
     /// `None` while the request is still running.
     pub fn poll(&self) -> Option<Result<T>> {
         match self.0.try_recv() {

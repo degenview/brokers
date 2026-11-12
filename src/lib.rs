@@ -13,6 +13,7 @@
 
 pub mod adapter;
 pub mod auth;
+pub mod edit_session;
 pub mod error;
 pub mod http;
 pub mod model;
