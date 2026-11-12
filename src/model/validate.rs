@@ -94,6 +94,23 @@ impl fmt::Display for Issue {
 
 /// Whether `value` is an exact multiple of `increment`. A zero increment accepts anything (a
 /// broker that publishes no increment imposes none we know of).
+/// A clicked price as an exact decimal on the market's increment: the *nearest* valid price (a click
+/// has no precision to preserve; this is the one place a price is rounded, and only on purpose).
+/// `None` for a price that is not positive and finite, or that rounds to nothing.
+pub fn snap_to_increment(price: f64, increment: Decimal) -> Option<Decimal> {
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    // Through text, so 0.1 stays 0.1 and not 0.1000000000000000055.
+    let exact: Decimal = format!("{price}").parse().ok()?;
+    let snapped = if increment.is_zero() {
+        exact
+    } else {
+        (exact / increment).round() * increment
+    };
+    (snapped > Decimal::ZERO).then_some(snapped.normalize())
+}
+
 pub fn is_multiple(value: Decimal, increment: Decimal) -> bool {
     increment.is_zero() || (value % increment).is_zero()
 }
@@ -430,6 +447,26 @@ pub fn funds_shortfall(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_click_snaps_to_the_nearest_valid_price_and_stays_exact() {
+        let d = crate::model::test_support::d;
+        assert_eq!(snap_to_increment(90_000.004, d("0.01")), Some(d("90000")));
+        assert_eq!(
+            snap_to_increment(90_000.006, d("0.01")),
+            Some(d("90000.01"))
+        );
+        assert_eq!(snap_to_increment(0.1, d("0.1")), Some(d("0.1")));
+        assert_eq!(
+            snap_to_increment(123.456, Decimal::ZERO),
+            Some(d("123.456"))
+        );
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(snap_to_increment(bad, d("0.01")), None, "{bad}");
+        }
+        // Rounds to nothing: not a price.
+        assert_eq!(snap_to_increment(0.001, d("1")), None);
+    }
+
     use super::*;
     use crate::model::capabilities::Tradability;
     use crate::model::test_support::d;

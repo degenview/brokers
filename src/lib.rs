@@ -38,8 +38,8 @@ pub use model::capabilities::{Capabilities, Tradability};
 pub use model::types::*;
 pub use model::validate;
 pub use runtime::{
-    BrokerRuntime, BrokerSnapshot, NoticeSink, Pending, PendingState, PendingView, RuntimeConfig,
-    Status, Waker,
+    BrokerRuntime, BrokerSnapshot, NoticeSink, OrderBlock, Pending, PendingState, PendingView,
+    RuntimeConfig, Status, Waker,
 };
 pub use rust_decimal::Decimal;
 pub use secret::{Credentials, MemorySecretStore, SecretStore, SecretStoreError};

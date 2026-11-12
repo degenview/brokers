@@ -136,6 +136,31 @@ pub struct PendingView {
     pub state: PendingState,
 }
 
+/// Why a new order cannot be placed in a market through this connection right now. The checks are in
+/// this order, and the first that fails is the reason, so the sentence an interface shows is always
+/// the most basic thing wrong.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderBlock {
+    /// Connecting, syncing, reconnecting or stopped: orders are paused until it is live again.
+    NotLive,
+    /// The broker refused the credentials or the connection failed for good: the user must act.
+    NeedsAttention,
+    /// The record of orders waiting for confirmation cannot be read, so an order that may be live
+    /// could be missing from it.
+    JournalUnreadable,
+    /// The credential can view but not trade.
+    ViewOnly,
+    /// The market's rules have not been read yet.
+    RulesNotRead,
+    /// The market list is loaded and this market is not on it.
+    MarketNotOffered,
+    /// The broker's own words for why this market cannot be traded with this account.
+    MarketNotTradable(&'static str),
+}
+
+/// Said when the broker marks a market untradable without saying why.
+pub const NOT_TRADABLE: &str = "Trading is not available in this market right now.";
+
 /// Everything an interface needs to draw, as of one moment.
 #[derive(Clone, Debug)]
 pub struct BrokerSnapshot {
@@ -219,6 +244,40 @@ impl BrokerSnapshot {
             order,
             account: self.account.as_ref().map(|account| account.id.clone()),
             generation: self.generation,
+        }
+    }
+
+    /// Why a new order cannot be placed in `product` now, or `None` when it can: the connection must
+    /// be live and healthy, the record of unconfirmed orders readable, the credential allowed to
+    /// trade, and the broker must list the market and say it can be traded. (Whether a *chart's*
+    /// market is this product, and replay, are the interface's questions.)
+    pub fn order_block(&self, product: &ProductId) -> Option<OrderBlock> {
+        match &self.status {
+            Status::Live => {}
+            Status::Failed(_) => return Some(OrderBlock::NeedsAttention),
+            _ => return Some(OrderBlock::NotLive),
+        }
+        if self.journal_error.is_some() {
+            return Some(OrderBlock::JournalUnreadable);
+        }
+        if !self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.permissions.can_trade)
+        {
+            return Some(OrderBlock::ViewOnly);
+        }
+        match self.capabilities_of(product) {
+            // Not read yet is different from not on the list: once the market list is loaded, a
+            // market missing from it never will be, so it must not read as "reading" for ever.
+            None if self.capabilities.is_empty() => Some(OrderBlock::RulesNotRead),
+            None => Some(OrderBlock::MarketNotOffered),
+            Some(caps) if !caps.is_tradable() => Some(OrderBlock::MarketNotTradable(
+                self.product(product)
+                    .and_then(|spec| spec.restrictions.blocked_reason())
+                    .unwrap_or(NOT_TRADABLE),
+            )),
+            Some(_) => None,
         }
     }
 
@@ -1626,5 +1685,160 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.account = None;
         assert_eq!(snapshot.edit_world(&OrderId::new("o-1")).account, None);
+    }
+}
+
+#[cfg(test)]
+mod order_block_tests {
+    use super::*;
+    use crate::model::capabilities::Tradability;
+    use crate::model::test_support::d;
+    use crate::model::types::{AccountRef, Permissions, Restrictions};
+
+    fn id() -> BrokerId {
+        BrokerId::new("acme")
+    }
+
+    fn product() -> ProductId {
+        ProductId::new("BTC-USD")
+    }
+
+    fn spec(restrictions: Restrictions) -> ProductSpec {
+        ProductSpec {
+            id: product(),
+            base: "BTC".to_owned(),
+            quote: "USD".to_owned(),
+            display_name: "BTC-USD".to_owned(),
+            price_increment: d("0.01"),
+            base_increment: d("0.0001"),
+            quote_increment: d("0.01"),
+            base_min: d("0.0001"),
+            base_max: None,
+            quote_min: d("1"),
+            quote_max: None,
+            restrictions,
+            fetched_ms: 0,
+        }
+    }
+
+    fn caps(tradable: bool) -> Capabilities {
+        let mut caps = Capabilities::blocked("no");
+        if tradable {
+            caps.tradable = Tradability::Yes;
+        }
+        caps
+    }
+
+    /// A live, healthy, trading connection that lists BTC-USD as tradable.
+    fn ready() -> BrokerSnapshot {
+        let mut snapshot = BrokerSnapshot::empty(id());
+        snapshot.status = Status::Live;
+        snapshot.session = Some(Session {
+            permissions: Permissions {
+                can_view: true,
+                can_trade: true,
+                can_transfer: false,
+            },
+            accounts: Vec::<AccountRef>::new(),
+        });
+        snapshot.products = Arc::new(vec![spec(Restrictions::default())]);
+        snapshot.capabilities = Arc::new(HashMap::from([(product(), caps(true))]));
+        snapshot
+    }
+
+    #[test]
+    fn a_live_healthy_trading_connection_with_a_tradable_market_has_no_block() {
+        assert_eq!(ready().order_block(&product()), None);
+    }
+
+    #[test]
+    fn the_connection_comes_first() {
+        let mut snapshot = ready();
+        snapshot.status = Status::Syncing;
+        assert_eq!(snapshot.order_block(&product()), Some(OrderBlock::NotLive));
+        snapshot.status = Status::Reconnecting {
+            since_ms: 0,
+            reason: String::new(),
+        };
+        assert_eq!(snapshot.order_block(&product()), Some(OrderBlock::NotLive));
+        snapshot.status = Status::Failed(BrokerError::new(ErrorKind::Auth, "revoked"));
+        assert_eq!(
+            snapshot.order_block(&product()),
+            Some(OrderBlock::NeedsAttention)
+        );
+        // A failed connection outranks every later reason.
+        snapshot.session = None;
+        assert_eq!(
+            snapshot.order_block(&product()),
+            Some(OrderBlock::NeedsAttention)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_journal_then_a_view_only_key_then_the_market() {
+        let mut snapshot = ready();
+        snapshot.journal_error = Some(BrokerError::new(ErrorKind::Invalid, "unreadable"));
+        snapshot.session = None;
+        assert_eq!(
+            snapshot.order_block(&product()),
+            Some(OrderBlock::JournalUnreadable)
+        );
+        snapshot.journal_error = None;
+        assert_eq!(snapshot.order_block(&product()), Some(OrderBlock::ViewOnly));
+        snapshot.session = ready().session.map(|mut session| {
+            session.permissions.can_trade = false;
+            session
+        });
+        assert_eq!(snapshot.order_block(&product()), Some(OrderBlock::ViewOnly));
+    }
+
+    #[test]
+    fn a_market_not_read_yet_is_told_from_one_that_is_not_offered() {
+        let mut snapshot = ready();
+        snapshot.capabilities = Arc::new(HashMap::new());
+        assert_eq!(
+            snapshot.order_block(&product()),
+            Some(OrderBlock::RulesNotRead),
+            "no market has been read yet"
+        );
+        snapshot.capabilities = Arc::new(HashMap::from([(ProductId::new("ETH-USD"), caps(true))]));
+        assert_eq!(
+            snapshot.order_block(&product()),
+            Some(OrderBlock::MarketNotOffered),
+            "the list is loaded and this market is not on it"
+        );
+    }
+
+    #[test]
+    fn an_untradable_market_says_why_in_the_brokers_words_or_a_plain_default() {
+        let mut snapshot = ready();
+        snapshot.capabilities = Arc::new(HashMap::from([(product(), caps(false))]));
+        assert_eq!(
+            snapshot.order_block(&product()),
+            Some(OrderBlock::MarketNotTradable(NOT_TRADABLE))
+        );
+        snapshot.products = Arc::new(vec![spec(Restrictions {
+            cancel_only: true,
+            ..Restrictions::default()
+        })]);
+        assert_eq!(
+            snapshot.order_block(&product()),
+            Some(OrderBlock::MarketNotTradable(
+                "This market only accepts cancellations right now."
+            ))
+        );
+    }
+
+    #[test]
+    fn it_agrees_with_can_send_orders_about_the_connection() {
+        let mut snapshot = ready();
+        assert!(snapshot.can_send_orders());
+        snapshot.journal_error = Some(BrokerError::new(ErrorKind::Invalid, "unreadable"));
+        assert!(!snapshot.can_send_orders());
+        assert!(snapshot.order_block(&product()).is_some());
+        snapshot.journal_error = None;
+        snapshot.status = Status::Stopped;
+        assert!(!snapshot.can_send_orders());
+        assert!(snapshot.order_block(&product()).is_some());
     }
 }
