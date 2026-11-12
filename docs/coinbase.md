@@ -118,7 +118,8 @@ unreadable at start, an accepted order whose record cannot be closed, a failed l
 ## The sandbox
 
 `CoinbaseSandbox` (id `coinbase-sandbox`, listed after Coinbase) is Coinbase's Advanced Trade
-sandbox as a broker of its own, so a test connection can never be mistaken for a real one. It is
+sandbox as a broker of its own, so a test connection can never be mistaken for a real one: its
+descriptor says `real_money = false`. It is
 checked against the real sandbox (`cargo run --example sandbox_check`), not against its documentation
 alone.
 
@@ -168,8 +169,7 @@ key is available, and this list is updated when it is.
 
 * **Spot only.** International-exchange perpetuals left Advanced Trade on 2026-10-01 (Coinbase moved
   them to a separate gateway); US futures and equities exist in the API but are not implemented.
-* **Sandbox.** `api-sandbox.coinbase.com` returns canned, static responses chosen by an `X-Sandbox`
-  header. It cannot test an order's life cycle, validation or the user WebSocket, so it is no
-  substitute for a real (small) account. This crate's tests use a loopback mock built from the
-  published specification instead.
+* **Sandbox.** Canned, static answers (see [The sandbox](#the-sandbox)). It cannot test an order's
+  life cycle, validation or the user WebSocket, so it is no substitute for a real (small) account.
+  This crate's tests use a loopback mock built from the published specification instead.
 * A market can be visible but not tradable for an account (`view_only`); capabilities say so.

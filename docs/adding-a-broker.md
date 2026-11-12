@@ -11,8 +11,9 @@ change: it draws from the broker's `Descriptor` and the neutral model.
 2. **Descriptor.** A `static Descriptor`: id (lower-case ASCII), display name, the credential
    fields its form collects (key, label, hint, secret?, kind), setup steps and permission note for
    the user, docs URL, `ClientIdRules` (maximum length; whether reusing an id returns the existing
-   order), the market-data source whose symbols it trades, its `AccountModel`, and the minimum gap
-   between requests.
+   order), the market-data source whose symbols it trades, its `AccountModel`, whether orders move
+   real money (`real_money`; `false` for a sandbox or other test environment, so the interface does
+   not call it live), and the minimum gap between requests.
 3. **Signer.** Implement `auth::RequestSigner` for the way it authenticates (a signed token, an
    HMAC over the query, an HMAC with a nonce). Per-broker signers live in the broker's module.
    Never include a secret in an error; build every error through `http::HttpClient` or a
