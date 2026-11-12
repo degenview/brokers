@@ -27,6 +27,7 @@ use crate::model::orders::{EditOutcome, EditPreview, OrderChange, OrderFingerpri
 use crate::model::preview::{
     PREVIEW_DEBOUNCE, PREVIEW_FRESH, PreviewAnswer, PreviewGate, preview_gate,
 };
+use crate::model::ticket::NotANumber;
 use crate::model::types::{
     AccountId, LiveOrder, OrderId, OrderSize, OrderStatus, OrderType, ProductSpec,
 };
@@ -72,10 +73,6 @@ pub struct EditFrame<'a> {
     pub generation: u64,
     pub spec: Option<&'a ProductSpec>,
 }
-
-/// A number the user typed that is not one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NotANumber;
 
 /// What is typed, already read: `None` is an empty box. The price box is the stop price of a
 /// stop-limit order.

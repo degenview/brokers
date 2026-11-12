@@ -8,6 +8,7 @@ pub mod orders;
 pub mod pending;
 pub mod preview;
 pub mod reducer;
+pub mod ticket;
 pub mod types;
 pub mod validate;
 
