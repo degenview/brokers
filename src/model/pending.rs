@@ -317,12 +317,12 @@ mod tests {
     fn a_blob_journal_keys_records_by_account_and_resolves_only_its_own() {
         let blob = Blob::default();
         let journal = BlobJournal::new(&blob);
-        let broker = BrokerId::new("coinbase");
+        let broker = BrokerId::new("acme");
         let (a, b) = (AccountId::new("a"), AccountId::new("b"));
-        journal.record(&submission("coinbase", "a", "c1")).unwrap();
-        journal.record(&submission("coinbase", "b", "c1")).unwrap();
+        journal.record(&submission("acme", "a", "c1")).unwrap();
+        journal.record(&submission("acme", "b", "c1")).unwrap();
         // Recording the same order again replaces it rather than doubling it.
-        journal.record(&submission("coinbase", "a", "c1")).unwrap();
+        journal.record(&submission("acme", "a", "c1")).unwrap();
         assert_eq!(journal.unresolved(broker).unwrap().len(), 2);
         let none = SubmissionOutcome::NotPlaced;
         journal
@@ -347,7 +347,7 @@ mod tests {
     fn a_blob_journal_lists_one_brokers_records_only() {
         let blob = Blob::default();
         let journal = BlobJournal::new(&blob);
-        journal.record(&submission("coinbase", "a", "c1")).unwrap();
+        journal.record(&submission("acme", "a", "c1")).unwrap();
         journal.record(&submission("other", "a", "c2")).unwrap();
         let found = journal.unresolved(BrokerId::new("other")).unwrap();
         assert_eq!(found.len(), 1);
@@ -358,22 +358,22 @@ mod tests {
     fn an_unreadable_list_is_an_error_and_is_never_overwritten() {
         let blob = Blob::default();
         let journal = BlobJournal::new(&blob);
-        journal.record(&submission("coinbase", "a", "c1")).unwrap();
+        journal.record(&submission("acme", "a", "c1")).unwrap();
         blob.unreadable
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let saves = blob.saves.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(journal.record(&submission("coinbase", "a", "c2")).is_err());
+        assert!(journal.record(&submission("acme", "a", "c2")).is_err());
         assert!(
             journal
                 .resolve(
-                    BrokerId::new("coinbase"),
+                    BrokerId::new("acme"),
                     &AccountId::new("a"),
                     &ClientOrderId::new("c1"),
                     &SubmissionOutcome::NotPlaced
                 )
                 .is_err()
         );
-        assert!(journal.unresolved(BrokerId::new("coinbase")).is_err());
+        assert!(journal.unresolved(BrokerId::new("acme")).is_err());
         assert_eq!(
             blob.saves.load(std::sync::atomic::Ordering::SeqCst),
             saves,
@@ -387,6 +387,6 @@ mod tests {
         let journal = BlobJournal::new(&blob);
         blob.unwritable
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(journal.record(&submission("coinbase", "a", "c1")).is_err());
+        assert!(journal.record(&submission("acme", "a", "c1")).is_err());
     }
 }
