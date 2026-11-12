@@ -225,12 +225,39 @@ pub fn run_all(fresh: impl Fn() -> Box<dyn Exchange>) {
             "a failed lookup keeps the unconfirmed order",
             a_failed_lookup_keeps_the_unconfirmed_order,
         ),
+        (
+            "a wanted price is read and never shown once old",
+            a_wanted_price_is_read_and_never_shown_once_old,
+        ),
     ];
     for (name, scenario) in scenarios {
         let exchange = fresh();
         eprintln!("conformance: {name}");
         scenario(exchange.as_ref());
     }
+}
+
+fn a_wanted_price_is_read_and_never_shown_once_old(exchange: &dyn Exchange) {
+    let f = Fixture::start(exchange);
+    f.wait_live();
+    let product = exchange.draft().product;
+    assert!(
+        f.runtime.fresh_quote(&product).is_none(),
+        "nothing asked, nothing read"
+    );
+    f.runtime.want_quote(&product);
+    wait_until("the price to arrive", || {
+        f.runtime.tick_quotes();
+        f.runtime.fresh_quote(&product).is_some()
+    });
+    let quote = f.runtime.fresh_quote(&product).expect("a fresh price");
+    assert!(quote.bid.is_some() && quote.ask.is_some());
+    // Time passes with nobody asking again: the price the exchange stamped is now too old to show.
+    f.clock.advance(11_000);
+    assert!(
+        f.runtime.fresh_quote(&product).is_none(),
+        "a price older than ten seconds is not shown as current"
+    );
 }
 
 fn connects_and_reads_the_account(exchange: &dyn Exchange) {
