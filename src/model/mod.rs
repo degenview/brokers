@@ -8,6 +8,7 @@ pub mod pending;
 pub mod reducer;
 pub mod types;
 pub mod validate;
+pub mod valuation;
 
 #[cfg(test)]
 pub(crate) mod test_support {
