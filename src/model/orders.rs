@@ -3,7 +3,9 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::types::{AccountId, LiveOrder, OrderId, OrderSize, OrderStatus, ProductId, Side};
+use super::types::{
+    AccountId, LiveOrder, OrderId, OrderSize, OrderStatus, ProductId, ProductSpec, Side,
+};
 
 /// A problem the broker found with an order or an edit before it was placed. Shown inline.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -149,6 +151,24 @@ pub enum EditOutcome {
     Native,
     /// The broker replaced the order atomically under a new id.
     ReplacedAtomically(OrderId),
+}
+
+/// An open order and what an edit of it is read against, all from one snapshot of the broker: the
+/// order, the account it is in, which connection that account was read on, and the market's rules.
+///
+/// An edit sheet is drawn from this every frame. A preview or a review made against one
+/// `generation` or `account` says nothing about another, which is what [`OrderFingerprint`] and the
+/// runtime's refusal of a changed order enforce when the edit is sent.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EditWorld {
+    /// The order as the broker has it; `None` once it is gone from the book.
+    pub order: Option<LiveOrder>,
+    /// The account the runtime trades in; `None` while there is none.
+    pub account: Option<AccountId>,
+    /// [`BrokerSnapshot::generation`](crate::runtime::BrokerSnapshot::generation) of the runtime.
+    pub generation: u64,
+    /// The rules of the order's market, once read.
+    pub spec: Option<ProductSpec>,
 }
 
 /// One page of a list, with where the next one starts.
