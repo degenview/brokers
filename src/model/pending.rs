@@ -74,6 +74,76 @@ pub trait PendingJournal: Send + Sync {
     fn unresolved(&self, broker: BrokerId) -> Result<Vec<PendingSubmission>, JournalError>;
 }
 
+/// Where a [`BlobJournal`] keeps its whole list of records: two operations, so an application can
+/// back it with one row, one setting or one file.
+pub trait JournalStorage: Send + Sync {
+    /// Every record kept. An error (the storage is unreachable, or what is there cannot be decoded)
+    /// is never "nothing pending": that would forget an order that may be live.
+    fn load(&self) -> Result<Vec<PendingSubmission>, JournalError>;
+    /// Replaces everything kept with `entries`, durably.
+    fn save(&self, entries: &[PendingSubmission]) -> Result<(), JournalError>;
+}
+
+/// A [`PendingJournal`] over a [`JournalStorage`]: one writer at a time doing read, change, write.
+/// A record is keyed by broker, **account** and client id, so the same client id in two portfolios
+/// is two orders. If the list cannot be read nothing is written, so nothing is lost by a bad read.
+pub struct BlobJournal<S> {
+    storage: S,
+    /// One writer at a time: a read-modify-write of the whole list.
+    gate: Mutex<()>,
+}
+
+impl<S: JournalStorage> BlobJournal<S> {
+    pub fn new(storage: S) -> Self {
+        Self {
+            storage,
+            gate: Mutex::new(()),
+        }
+    }
+}
+
+impl<S: JournalStorage> PendingJournal for BlobJournal<S> {
+    fn record(&self, entry: &PendingSubmission) -> Result<(), JournalError> {
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = self.storage.load()?;
+        entries.retain(|e| {
+            !(e.broker == entry.broker
+                && e.account == entry.account
+                && e.client_id == entry.client_id)
+        });
+        entries.push(entry.clone());
+        self.storage.save(&entries)
+    }
+
+    fn resolve(
+        &self,
+        broker: BrokerId,
+        account: &AccountId,
+        client_id: &ClientOrderId,
+        _outcome: &SubmissionOutcome,
+    ) -> Result<(), JournalError> {
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = self.storage.load()?;
+        let before = entries.len();
+        entries.retain(|e| {
+            !(e.broker == broker && &e.account == account && &e.client_id == client_id)
+        });
+        if entries.len() == before {
+            return Ok(());
+        }
+        self.storage.save(&entries)
+    }
+
+    fn unresolved(&self, broker: BrokerId) -> Result<Vec<PendingSubmission>, JournalError> {
+        Ok(self
+            .storage
+            .load()?
+            .into_iter()
+            .filter(|entry| entry.broker == broker)
+            .collect())
+    }
+}
+
 /// A journal in memory, for tests and for sessions that need none.
 #[derive(Default)]
 pub struct MemoryJournal {
@@ -198,5 +268,125 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[derive(Default)]
+    struct Blob {
+        kept: Mutex<Vec<PendingSubmission>>,
+        unreadable: std::sync::atomic::AtomicBool,
+        unwritable: std::sync::atomic::AtomicBool,
+        saves: std::sync::atomic::AtomicUsize,
+    }
+
+    impl JournalStorage for &Blob {
+        fn load(&self) -> Result<Vec<PendingSubmission>, JournalError> {
+            if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(JournalError("cannot be decoded".to_owned()));
+            }
+            Ok(self.kept.lock().unwrap().clone())
+        }
+
+        fn save(&self, entries: &[PendingSubmission]) -> Result<(), JournalError> {
+            if self.unwritable.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(JournalError("disk full".to_owned()));
+            }
+            self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.kept.lock().unwrap() = entries.to_vec();
+            Ok(())
+        }
+    }
+
+    fn submission(broker: &'static str, account: &str, client: &str) -> PendingSubmission {
+        use crate::model::types::{OrderKind, ProductId, Side};
+        PendingSubmission {
+            broker: BrokerId::new(broker),
+            account: AccountId::new(account),
+            client_id: ClientOrderId::new(client),
+            draft: OrderDraft {
+                product: ProductId::new("BTC-USD"),
+                side: Side::Buy,
+                kind: OrderKind::Market {
+                    size: crate::model::types::OrderSize::Base(crate::model::test_support::d("1")),
+                },
+            },
+            created_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_blob_journal_keys_records_by_account_and_resolves_only_its_own() {
+        let blob = Blob::default();
+        let journal = BlobJournal::new(&blob);
+        let broker = BrokerId::new("acme");
+        let (a, b) = (AccountId::new("a"), AccountId::new("b"));
+        journal.record(&submission("acme", "a", "c1")).unwrap();
+        journal.record(&submission("acme", "b", "c1")).unwrap();
+        // Recording the same order again replaces it rather than doubling it.
+        journal.record(&submission("acme", "a", "c1")).unwrap();
+        assert_eq!(journal.unresolved(broker).unwrap().len(), 2);
+        let none = SubmissionOutcome::NotPlaced;
+        journal
+            .resolve(broker, &a, &ClientOrderId::new("c1"), &none)
+            .unwrap();
+        let left = journal.unresolved(broker).unwrap();
+        assert_eq!(
+            left.len(),
+            1,
+            "the other account's order with the same id stays"
+        );
+        assert_eq!(left[0].account, b);
+        // Closing what is not there writes nothing.
+        let saves = blob.saves.load(std::sync::atomic::Ordering::SeqCst);
+        journal
+            .resolve(broker, &a, &ClientOrderId::new("c1"), &none)
+            .unwrap();
+        assert_eq!(blob.saves.load(std::sync::atomic::Ordering::SeqCst), saves);
+    }
+
+    #[test]
+    fn a_blob_journal_lists_one_brokers_records_only() {
+        let blob = Blob::default();
+        let journal = BlobJournal::new(&blob);
+        journal.record(&submission("acme", "a", "c1")).unwrap();
+        journal.record(&submission("other", "a", "c2")).unwrap();
+        let found = journal.unresolved(BrokerId::new("other")).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].client_id.as_str(), "c2");
+    }
+
+    #[test]
+    fn an_unreadable_list_is_an_error_and_is_never_overwritten() {
+        let blob = Blob::default();
+        let journal = BlobJournal::new(&blob);
+        journal.record(&submission("acme", "a", "c1")).unwrap();
+        blob.unreadable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let saves = blob.saves.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(journal.record(&submission("acme", "a", "c2")).is_err());
+        assert!(
+            journal
+                .resolve(
+                    BrokerId::new("acme"),
+                    &AccountId::new("a"),
+                    &ClientOrderId::new("c1"),
+                    &SubmissionOutcome::NotPlaced
+                )
+                .is_err()
+        );
+        assert!(journal.unresolved(BrokerId::new("acme")).is_err());
+        assert_eq!(
+            blob.saves.load(std::sync::atomic::Ordering::SeqCst),
+            saves,
+            "nothing was written over what could not be read"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_is_reported_so_the_order_is_not_sent() {
+        let blob = Blob::default();
+        let journal = BlobJournal::new(&blob);
+        blob.unwritable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(journal.record(&submission("acme", "a", "c1")).is_err());
     }
 }
