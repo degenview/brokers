@@ -1,8 +1,8 @@
 //! A venue-neutral trading model and broker adapters for DegenView.
 //!
 //! The crate has no user interface, no database and no async runtime. It talks to the application
-//! through small traits ([`SecretStore`], and in later versions a journal, an event sink and a
-//! clock), so the application decides where secrets and records live.
+//! through small traits ([`SecretStore`], [`model::pending::PendingJournal`], [`Waker`],
+//! [`NoticeSink`] and [`Clock`]), so the application decides where secrets and records live.
 //!
 //! * [`model`] is pure: decimal types, order drafts, validation, capabilities.
 //! * [`Broker`] / [`Connection`] are what an exchange implements; [`registry`] lists them.
