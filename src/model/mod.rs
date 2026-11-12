@@ -5,9 +5,11 @@ pub mod capabilities;
 pub mod events;
 pub mod orders;
 pub mod pending;
+pub mod quotes;
 pub mod reducer;
 pub mod types;
 pub mod validate;
+pub mod valuation;
 
 #[cfg(test)]
 pub(crate) mod test_support {
