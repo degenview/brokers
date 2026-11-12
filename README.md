@@ -1,4 +1,4 @@
-# degenview-brokers
+# Brokers Crate
 
 Broker adapters and a trading model for [DegenView](https://github.com/degenview/degenview).
 Coinbase Advanced Trade (spot) first. Blocking Rust: no UI, no database, no async runtime.
