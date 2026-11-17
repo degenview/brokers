@@ -11,9 +11,11 @@ use std::time::Duration;
 use crate::net::{Direct, Network, Proxy, ProxyProtocol, Route};
 
 /// A [`Network`] whose route a test sets by hand, counting how often it is consulted. Dialling
-/// always connects directly (the tests aim at loopback servers) and is recorded.
+/// always connects directly (the tests aim at loopback servers) and is recorded, unless the network
+/// was told to fail every dial.
 pub struct ScriptedNetwork {
     route: Mutex<Route>,
+    dial_error: Option<String>,
     routes_asked: AtomicUsize,
     dialled: Mutex<Vec<(String, u16)>>,
 }
@@ -23,9 +25,18 @@ impl ScriptedNetwork {
     pub fn new(route: Route) -> Self {
         Self {
             route: Mutex::new(route),
+            dial_error: None,
             routes_asked: AtomicUsize::new(0),
             dialled: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The same network, but every dial fails with `message` (kind `PermissionDenied`), as a proxy
+    /// that refuses the credentials would.
+    #[must_use]
+    pub fn failing_dial(mut self, message: impl Into<String>) -> Self {
+        self.dial_error = Some(message.into());
+        self
     }
 
     /// From now on, answer `route`.
@@ -55,6 +66,12 @@ impl Network for ScriptedNetwork {
             .lock()
             .expect("dial lock")
             .push((host.to_owned(), port));
+        if let Some(message) = &self.dial_error {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                message.clone(),
+            ));
+        }
         Direct.dial(host, port, timeout)
     }
 }

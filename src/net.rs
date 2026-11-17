@@ -151,6 +151,10 @@ pub trait Network: Send + Sync {
     /// A TCP stream to `host:port`, already connected (and tunnelled, when the route is a proxy),
     /// before any TLS. `host` is a bare name or address. A connection that takes longer than
     /// `timeout` is an error.
+    ///
+    /// When the route is a proxy, only the [`io::ErrorKind`] of a failure is ever shown: the error
+    /// text may quote the proxy's own words or the credentials it was given, so the crate does not
+    /// trust it for display.
     fn dial(&self, host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream>;
 }
 
@@ -183,6 +187,19 @@ fn dial_direct(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream
     }
     Err(last_error
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address for the host")))
+}
+
+/// What to show when dialling over `route` failed with `error`.
+///
+/// Over a [`Route::Direct`] connection the error text is shown as it is: no proxy credentials exist
+/// on that path. Over a proxy only the error's kind is shown, because a [`Network`]'s error text is
+/// written by the consumer and may carry the proxy's reply or the credentials it was given; the
+/// scrubber knows only broker credentials, and ignores short values.
+pub(crate) fn dial_failure(route: &Route, error: &io::Error) -> String {
+    match route {
+        Route::Direct => error.to_string(),
+        Route::Proxy(_) => format!("could not connect through the proxy ({})", error.kind()),
+    }
 }
 
 /// The proxy a [`Route`] names, in `ureq`'s terms; `None` for a direct route.
@@ -273,6 +290,36 @@ mod tests {
         assert_eq!(proxy.username(), Some("alice"));
         assert_eq!(proxy.password(), Some("p@ss:word"));
         assert_eq!(proxy.port(), 1080);
+    }
+
+    #[test]
+    fn awkward_proxy_credentials_reach_ureq_unchanged() {
+        let cases = [
+            ("alice", "p@ss:word"),
+            ("bob", "a/b#c?d"),
+            ("me@work", "pw1"),
+        ];
+        for (user, password) in cases {
+            let route = Route::Proxy(
+                Proxy::new(ProxyProtocol::Http, "proxy.example", 3128)
+                    .with_credentials(ProxyCredentials::new(user, password)),
+            );
+            let proxy = to_ureq(&route).unwrap().expect("a proxy");
+            assert_eq!(proxy.username(), Some(user));
+            assert_eq!(proxy.password(), Some(password));
+            assert_eq!(proxy.host(), "proxy.example");
+            assert_eq!(proxy.port(), 3128);
+        }
+    }
+
+    #[test]
+    fn a_dial_failure_over_a_proxy_shows_only_the_error_kind() {
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, "407 for alice:pw1");
+        let proxied = Route::Proxy(Proxy::new(ProxyProtocol::Http, "proxy.example", 3128));
+        let shown = dial_failure(&proxied, &error);
+        assert!(shown.contains("permission denied"), "{shown}");
+        assert!(!shown.contains("pw1") && !shown.contains("407"), "{shown}");
+        assert_eq!(dial_failure(&Route::Direct, &error), "407 for alice:pw1");
     }
 
     #[test]

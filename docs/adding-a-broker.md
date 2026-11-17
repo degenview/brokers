@@ -50,7 +50,10 @@ if you do): the consumer may route everything through a proxy. Build requests wi
 `HttpClient::new(.., Arc::clone(env.network()))`, and open the stream's socket with
 `ws::connect(url, read_timeout, network)`, then give the `Health` it returns the route with
 `watch_route(network, url, route)`, so the stream reconnects when the route changes. Keep the
-`Arc<dyn Network>` from `Env` in your connection for that.
+`Arc<dyn Network>` from `Env` in your connection for that. A failed dial over a proxy comes back
+from `ws::connect` as a fixed message naming only the error's kind, never the `Network`'s own text
+(it may quote the proxy's reply or credentials), so show what `connect` returns and nothing more
+about the dial.
 
 The first account of the `Session` your connection returns is the account every journal entry is
 scoped to, so its id must be non-empty and the same for the same credential every time (a

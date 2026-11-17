@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
-use crate::net::{Network, Route};
+use crate::net::{Network, Route, dial_failure};
 
 pub type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -40,7 +40,8 @@ pub fn host_and_port(url: &str) -> Option<(String, u16)> {
 /// quiet socket returns to the caller instead of blocking.
 ///
 /// The TCP connection comes from `network` (direct, or tunnelled through a proxy); TLS is then
-/// negotiated end to end with the host in `url`. Also returns the route in force when connecting,
+/// negotiated end to end with the host in `url`. A failed dial over a proxy is reported by its kind
+/// only, never its text. Also returns the route in force when connecting,
 /// which [`Health::watch_route`] compares against later.
 pub fn connect(
     url: &str,
@@ -51,7 +52,7 @@ pub fn connect(
     let route = network.route(url);
     let stream = network
         .dial(&host, port, CONNECT_TIMEOUT)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| dial_failure(&route, &error))?;
     stream
         .set_read_timeout(Some(CONNECT_TIMEOUT))
         .map_err(|error| error.to_string())?;
@@ -282,6 +283,8 @@ fn jittered(delay: Duration, random: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::{Proxy, ProxyProtocol};
+    use crate::testing::network::ScriptedNetwork;
 
     #[test]
     fn urls_split_into_host_and_port() {
@@ -296,6 +299,32 @@ mod tests {
         assert_eq!(host_and_port("ws://[::1]:9"), Some(("::1".to_owned(), 9)));
         assert_eq!(host_and_port("http://example.com"), None);
         assert_eq!(host_and_port("wss://"), None);
+    }
+
+    fn proxy_route() -> Route {
+        Route::Proxy(Proxy::new(ProxyProtocol::Http, "proxy.example", 3128))
+    }
+
+    fn connect_error(network: &ScriptedNetwork) -> String {
+        match connect("ws://127.0.0.1:9", Duration::from_secs(1), network) {
+            Ok(_) => panic!("the dial was meant to fail"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn a_dial_failure_over_a_proxy_never_quotes_the_network() {
+        let text = "407 Proxy Authentication Required for alice:pw1";
+        let network = ScriptedNetwork::new(proxy_route()).failing_dial(text);
+        let error = connect_error(&network);
+        assert!(!error.contains("pw1") && !error.contains("407"), "{error}");
+        assert!(error.contains("permission denied"), "{error}");
+    }
+
+    #[test]
+    fn a_dial_failure_without_a_proxy_keeps_the_text() {
+        let network = ScriptedNetwork::new(Route::Direct).failing_dial("no route to host");
+        assert_eq!(connect_error(&network), "no route to host");
     }
 
     #[test]
@@ -321,8 +350,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    use crate::net::{Proxy, ProxyProtocol};
-    use crate::testing::network::ScriptedNetwork;
     use std::net::TcpListener;
 
     /// A plain WebSocket server on loopback that accepts one client and then holds it open until

@@ -376,3 +376,42 @@ fn a_stream_on_the_default_network_connects_directly() {
     sink.wait_for("the connection", |e| connected_count(e) == 1);
     handle.stop();
 }
+
+#[test]
+fn a_proxy_dial_failure_never_shows_its_text_in_the_disconnect_reason() {
+    let rest = FakeCoinbase::start();
+    let stream = FakeStream::start();
+    let network = Arc::new(
+        ScriptedNetwork::new(Route::Direct)
+            .failing_dial("407 Proxy Authentication Required for alice:pw1"),
+    );
+    let connection = connection_via(&rest, &stream, network.clone());
+    // The proxy is chosen after connecting, so the key check goes straight to the fake exchange.
+    network.set_route(Route::Proxy(Proxy::new(
+        ProxyProtocol::Http,
+        "proxy.example",
+        3128,
+    )));
+    let sink = Arc::new(Collector::default());
+    let mut handle = connection.open_stream(sink.clone()).unwrap();
+    sink.wait_for("the disconnect", |e| {
+        e.iter()
+            .any(|e| matches!(e, StreamEvent::Disconnected { .. }))
+    });
+    let reasons: Vec<_> = sink
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            StreamEvent::Disconnected { reason } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    for reason in &reasons {
+        assert!(
+            !reason.contains("pw1") && !reason.contains("407"),
+            "{reason}"
+        );
+        assert!(reason.contains("through the proxy"), "{reason}");
+    }
+    handle.stop();
+}

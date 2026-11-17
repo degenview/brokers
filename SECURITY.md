@@ -25,6 +25,9 @@ negotiated end to end with the broker's host, and certificates are verified agai
 the user chose can still refuse or delay a connection, and an order whose request was sent but
 not answered stays `OutcomeUnknown`, exactly as with a direct connection.
 
+The crate does not trust the text of an error a `Network` returns when a proxy is in use: it may
+quote the proxy's reply or the credentials it was given. Only the error's kind is ever shown.
+
 ## How releases are protected
 
 The crate is published to crates.io from a signed tag on `main` by its maintainer; the
