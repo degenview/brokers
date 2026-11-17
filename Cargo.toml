@@ -29,7 +29,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # Blocking HTTP with rustls and no redirects (see `http`). Matches the application's version.
 # `socks-proxy` lets a `net::Route` go through a SOCKS proxy; it pulls in no further crate.
-ureq = { version = "3.4.2", features = ["socks-proxy"] }
+# 3.5.1 is the first release that percent-encodes proxy credentials (3.4.x mangles `@`, `:`, `/`).
+ureq = { version = "3.5.1", features = ["socks-proxy"] }
 # Blocking WebSockets for account streams. Same version and TLS roots as the application.
 tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 # JWT signing (ES256 and Ed25519). Already in the application's tree through rustls.
