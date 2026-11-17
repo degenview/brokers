@@ -26,6 +26,7 @@ use crate::model::types::{
     OrderDraft, OrderId, OrderType, Permissions, ProductId, ProductSpec, Quote, Restrictions,
     TifKind,
 };
+use crate::net::Network;
 use crate::scrub::Scrubber;
 use crate::secret::Credentials;
 
@@ -44,6 +45,7 @@ pub struct CoinbaseConnection {
     signer: Option<Arc<JwtSigner>>,
     ws_url: String,
     timing: StreamTiming,
+    network: Arc<dyn Network>,
     id: BrokerId,
     sandbox: bool,
 }
@@ -102,6 +104,7 @@ impl CoinbaseConnection {
             Arc::clone(&signer) as Arc<dyn RequestSigner>,
             scrubber,
             env.request_gap(DESCRIPTOR.min_request_gap_ms),
+            Arc::clone(env.network()),
         );
 
         let permissions: KeyPermissions = decode(
@@ -144,6 +147,7 @@ impl CoinbaseConnection {
             signer: Some(signer),
             ws_url: env.ws_url().unwrap_or(USER_HOST).to_owned(),
             timing: env.stream_timing,
+            network: Arc::clone(env.network()),
             id: ID,
             sandbox: false,
         })
@@ -158,6 +162,7 @@ impl CoinbaseConnection {
             Arc::new(Unsigned) as Arc<dyn RequestSigner>,
             Scrubber::new(std::iter::empty()),
             env.request_gap(super::descriptor::SANDBOX_DESCRIPTOR.min_request_gap_ms),
+            Arc::clone(env.network()),
         );
         Ok(Self {
             http,
@@ -177,6 +182,7 @@ impl CoinbaseConnection {
             signer: None,
             ws_url: String::new(),
             timing: env.stream_timing,
+            network: Arc::clone(env.network()),
             id: SANDBOX_ID,
             sandbox: true,
         })
@@ -494,6 +500,7 @@ impl Connection for CoinbaseConnection {
                 signer: Arc::clone(signer),
                 clock: Arc::clone(&self.clock),
                 timing: self.timing,
+                network: Arc::clone(&self.network),
             },
             sink,
         ))

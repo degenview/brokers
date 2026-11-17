@@ -1,17 +1,23 @@
-//! Blocking WebSocket plumbing for account streams: bounded connects, read deadlines, heartbeat
-//! checks and jittered reconnect pacing. Modelled on the DegenView application's market-feed
-//! helper so both behave alike; it has no dependency on the application.
+//! Blocking WebSocket plumbing for account streams: bounded connects through the consumer's
+//! [`Network`], read deadlines, heartbeat checks, route-change detection and jittered reconnect
+//! pacing. Modelled on the DegenView application's market-feed helper so both behave alike; it
+//! has no dependency on the application.
 
 use std::io;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
+use crate::net::{Network, Route, dial_failure};
+
 pub type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// How often an open socket asks the network whether its route changed.
+const ROUTE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Splits `ws(s)://host[:port]/path` into the pieces `connect` needs.
 pub fn host_and_port(url: &str) -> Option<(String, u16)> {
@@ -32,33 +38,31 @@ pub fn host_and_port(url: &str) -> Option<(String, u16)> {
 
 /// Opens a WebSocket with every network step bounded, and `read_timeout` set on the stream so a
 /// quiet socket returns to the caller instead of blocking.
-pub fn connect(url: &str, read_timeout: Duration) -> Result<Socket, String> {
+///
+/// The TCP connection comes from `network` (direct, or tunnelled through a proxy); TLS is then
+/// negotiated end to end with the host in `url`. A failed dial over a proxy is reported by its kind
+/// only, never its text. Also returns the route in force when connecting,
+/// which [`Health::watch_route`] compares against later.
+pub fn connect(
+    url: &str,
+    read_timeout: Duration,
+    network: &dyn Network,
+) -> Result<(Socket, Route), String> {
     let (host, port) = host_and_port(url).ok_or_else(|| "not a WebSocket address".to_owned())?;
-    let addresses = (host.as_str(), port)
-        .to_socket_addrs()
+    let route = network.route(url);
+    let stream = network
+        .dial(&host, port, CONNECT_TIMEOUT)
+        .map_err(|error| dial_failure(&route, &error))?;
+    stream
+        .set_read_timeout(Some(CONNECT_TIMEOUT))
         .map_err(|error| error.to_string())?;
-    let mut last_error = None;
-    for address in addresses.take(4) {
-        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
-            Ok(stream) => {
-                stream
-                    .set_read_timeout(Some(CONNECT_TIMEOUT))
-                    .map_err(|error| error.to_string())?;
-                stream
-                    .set_write_timeout(Some(CONNECT_TIMEOUT))
-                    .map_err(|error| error.to_string())?;
-                let (mut socket, _) =
-                    tungstenite::client_tls(url, stream).map_err(|error| error.to_string())?;
-                set_timeouts(&mut socket, read_timeout).map_err(|error| error.to_string())?;
-                return Ok(socket);
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.map_or_else(
-        || "no address for the WebSocket host".to_owned(),
-        |error| error.to_string(),
-    ))
+    stream
+        .set_write_timeout(Some(CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    let (mut socket, _) =
+        tungstenite::client_tls(url, stream).map_err(|error| error.to_string())?;
+    set_timeouts(&mut socket, read_timeout).map_err(|error| error.to_string())?;
+    Ok((socket, route))
 }
 
 fn set_timeouts(socket: &mut Socket, timeout: Duration) -> io::Result<()> {
@@ -85,6 +89,7 @@ pub struct Health {
     max_data_silence: Duration,
     ping_after: Duration,
     pong_timeout: Duration,
+    route_watch: Option<RouteWatch>,
 }
 
 impl Health {
@@ -97,6 +102,7 @@ impl Health {
             max_data_silence,
             ping_after: Duration::from_secs(15),
             pong_timeout: Duration::from_secs(10),
+            route_watch: None,
         }
     }
 
@@ -107,11 +113,30 @@ impl Health {
         self
     }
 
+    /// Fails the socket when the route `network` gives for `url` is no longer `route` (the one the
+    /// socket connected over), checked at most once a second. The stream's reconnect logic then
+    /// connects again over the new route.
+    #[must_use]
+    pub fn watch_route(mut self, network: Arc<dyn Network>, url: &str, route: Route) -> Self {
+        self.route_watch = Some(RouteWatch::new(network, url, route, ROUTE_CHECK_INTERVAL));
+        self
+    }
+
     /// A message, or `None` when the read timed out and the socket is still believed healthy. An
     /// error means the socket is dead (closed, failed, or silent for too long).
     // `tungstenite::Error` is large, but it is the error type the socket API hands back.
     #[allow(clippy::result_large_err)]
     pub fn read(&mut self, socket: &mut Socket) -> tungstenite::Result<Option<Message>> {
+        if self
+            .route_watch
+            .as_mut()
+            .is_some_and(RouteWatch::has_changed)
+        {
+            return Err(tungstenite::Error::Io(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "the network route changed",
+            )));
+        }
         match socket.read() {
             Ok(Message::Pong(_)) => {
                 self.last_message = Instant::now();
@@ -155,6 +180,41 @@ impl Health {
             self.ping_sent = Some(now);
         }
         Ok(None)
+    }
+}
+
+/// Notices that the route a connection was made over is no longer the one in force.
+struct RouteWatch {
+    network: Arc<dyn Network>,
+    url: String,
+    route: Route,
+    interval: Duration,
+    last_check: Option<Instant>,
+}
+
+impl RouteWatch {
+    fn new(network: Arc<dyn Network>, url: &str, route: Route, interval: Duration) -> Self {
+        Self {
+            network,
+            url: url.to_owned(),
+            route,
+            interval,
+            last_check: None,
+        }
+    }
+
+    /// Whether the network now names another route. Asks at most once per interval; in between
+    /// the answer is "no".
+    fn has_changed(&mut self) -> bool {
+        let now = Instant::now();
+        if self
+            .last_check
+            .is_some_and(|last| now.duration_since(last) < self.interval)
+        {
+            return false;
+        }
+        self.last_check = Some(now);
+        self.network.route(&self.url) != self.route
     }
 }
 
@@ -223,6 +283,8 @@ fn jittered(delay: Duration, random: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::{Proxy, ProxyProtocol};
+    use crate::testing::network::ScriptedNetwork;
 
     #[test]
     fn urls_split_into_host_and_port() {
@@ -237,6 +299,32 @@ mod tests {
         assert_eq!(host_and_port("ws://[::1]:9"), Some(("::1".to_owned(), 9)));
         assert_eq!(host_and_port("http://example.com"), None);
         assert_eq!(host_and_port("wss://"), None);
+    }
+
+    fn proxy_route() -> Route {
+        Route::Proxy(Proxy::new(ProxyProtocol::Http, "proxy.example", 3128))
+    }
+
+    fn connect_error(network: &ScriptedNetwork) -> String {
+        match connect("ws://127.0.0.1:9", Duration::from_secs(1), network) {
+            Ok(_) => panic!("the dial was meant to fail"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn a_dial_failure_over_a_proxy_never_quotes_the_network() {
+        let text = "407 Proxy Authentication Required for alice:pw1";
+        let network = ScriptedNetwork::new(proxy_route()).failing_dial(text);
+        let error = connect_error(&network);
+        assert!(!error.contains("pw1") && !error.contains("407"), "{error}");
+        assert!(error.contains("permission denied"), "{error}");
+    }
+
+    #[test]
+    fn a_dial_failure_without_a_proxy_keeps_the_text() {
+        let network = ScriptedNetwork::new(Route::Direct).failing_dial("no route to host");
+        assert_eq!(connect_error(&network), "no route to host");
     }
 
     #[test]
@@ -260,5 +348,91 @@ mod tests {
         let started = Instant::now();
         Backoff::with(Duration::from_secs(30), Duration::from_secs(30)).wait(&stop);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    use std::net::TcpListener;
+
+    /// A plain WebSocket server on loopback that accepts one client and then holds it open until
+    /// the returned sender is dropped. Returns its `ws://` address.
+    fn quiet_server() -> (String, std::sync::mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}", listener.local_addr().unwrap());
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let _socket = tungstenite::accept(stream);
+                let _ = held.recv();
+            }
+        });
+        (address, release)
+    }
+
+    fn other_route() -> Route {
+        Route::Proxy(Proxy::new(ProxyProtocol::Http, "proxy.example", 3128))
+    }
+
+    #[test]
+    fn a_connection_is_dialled_through_the_network_and_reports_its_route() {
+        let (url, _release) = quiet_server();
+        let network = ScriptedNetwork::new(Route::Direct);
+        let (_socket, route) = connect(&url, Duration::from_millis(50), &network).unwrap();
+        assert_eq!(route, Route::Direct);
+        let port = url.rsplit(':').next().unwrap().parse().unwrap();
+        assert_eq!(network.dialled(), [("127.0.0.1".to_owned(), port)]);
+    }
+
+    #[test]
+    fn a_failed_dial_is_an_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let network = ScriptedNetwork::new(Route::Direct);
+        assert!(connect(&url, Duration::from_millis(50), &network).is_err());
+    }
+
+    #[test]
+    fn a_route_watch_notices_a_change_and_asks_only_once_per_interval() {
+        let network = Arc::new(ScriptedNetwork::new(Route::Direct));
+        let mut watch = RouteWatch::new(
+            network.clone(),
+            "wss://stream.example.com",
+            Route::Direct,
+            Duration::from_secs(3600),
+        );
+        assert!(!watch.has_changed());
+        network.set_route(other_route());
+        // Within the interval the network is not asked again.
+        assert!(!watch.has_changed());
+        assert_eq!(network.routes_asked(), 1);
+
+        let mut eager = RouteWatch::new(
+            network.clone(),
+            "wss://stream.example.com",
+            Route::Direct,
+            Duration::ZERO,
+        );
+        assert!(eager.has_changed());
+    }
+
+    #[test]
+    fn a_socket_whose_route_changed_fails_its_next_read() {
+        let (url, _release) = quiet_server();
+        let network = Arc::new(ScriptedNetwork::new(Route::Direct));
+        let (mut socket, route) =
+            connect(&url, Duration::from_millis(50), network.as_ref()).unwrap();
+        let mut health =
+            Health::new(Duration::from_secs(60)).watch_route(network.clone(), &url, route);
+
+        // Same route: the read just times out.
+        assert!(matches!(health.read(&mut socket), Ok(None)));
+        // A watch checks at most once a second, so a fresh one sees the change on its first read.
+        network.set_route(other_route());
+        let mut health =
+            Health::new(Duration::from_secs(60)).watch_route(network.clone(), &url, Route::Direct);
+        let error = health.read(&mut socket).unwrap_err();
+        assert!(
+            matches!(&error, tungstenite::Error::Io(io) if io.kind() == io::ErrorKind::ConnectionAborted),
+            "{error:?}"
+        );
     }
 }

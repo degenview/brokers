@@ -31,7 +31,8 @@ for a permission that would allow it.
 | `Broker`, `Descriptor` | One exchange: its id, credential fields, rules; `resolve_market`, `connect`. |
 | `Connection` | One blocking session: `balances`, `products`, `quote`, `preview`, `place`, `cancel`, `amend`, `order`, `open_orders`, `order_history`, `fills`, `find_by_client_id`, `open_stream`. |
 | `Credentials`, `SecretStore` | A broker's secrets (redacted `Debug`) and where the app keeps them. |
-| `Env` | Clock, stream timing, and loopback-only URL overrides (debug and test builds). |
+| `Env` | Clock, stream timing, the `Network` to connect through, and loopback-only URL overrides (debug and test builds). |
+| `Network`, `Route`, `Proxy`, `Direct` | How connections are made: the application answers `route(url)` (direct, or a proxy) and `dial(host, port, timeout)`; the default `Direct` connects straight to the host. |
 | `OrderDraft`, `validate` | What to place, and the check against `ProductSpec` rules. |
 | `LiveOrder`, `LiveFill`, `Balance`, `ProductSpec`, `Quote` | The model. All amounts are `Decimal`. |
 | `Capabilities` | What a credential can do in a market, and why not if it can't. |
@@ -87,6 +88,7 @@ println!("{:?}, can send orders: {}", snapshot.status, snapshot.can_send_orders(
 * A write is sent once and never retried. Unfinished means `OutcomeUnknown`, and a 409 on a write counts as unfinished.
 * An unconfirmed order belongs to the account that sent it; another account's records are held untouched.
 * Requests go only to the broker's own host, redirects are not followed, and no secret reaches an error.
+* Connections go through the `Network` the application supplies (`Env::with_network`). A proxy never changes the target host and TLS ends at the broker, so a proxy sees the host name and encrypted bytes only. Nothing reads `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` on its own: the default is direct. The route is asked again for every request, and an open stream reconnects within about a second of a change.
 
 ## Development
 

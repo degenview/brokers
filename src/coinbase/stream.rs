@@ -21,6 +21,7 @@ use super::jwt::JwtSigner;
 use super::mapping::order_from_user;
 use crate::adapter::{Clock, StreamHandle, StreamTiming};
 use crate::model::events::{EventSink, StreamEvent};
+use crate::net::Network;
 use crate::scrub::Scrubber;
 use crate::ws::{self, Backoff, Health};
 
@@ -54,6 +55,7 @@ pub(super) struct Config {
     pub signer: Arc<JwtSigner>,
     pub clock: Arc<dyn Clock>,
     pub timing: StreamTiming,
+    pub network: Arc<dyn Network>,
 }
 
 pub(super) fn spawn(config: Config, sink: Arc<dyn EventSink>) -> StreamHandle {
@@ -108,8 +110,12 @@ fn session(
     reconnect: &AtomicBool,
     backoff: &mut Backoff,
 ) -> Ended {
-    let mut socket = match ws::connect(&config.url, config.timing.read_timeout) {
-        Ok(socket) => socket,
+    let (mut socket, route) = match ws::connect(
+        &config.url,
+        config.timing.read_timeout,
+        config.network.as_ref(),
+    ) {
+        Ok(connected) => connected,
         Err(error) => return Ended::Failed(format!("could not connect: {error}")),
     };
     // Subscribe at once: the server drops a socket that does not within five seconds.
@@ -123,7 +129,8 @@ fn session(
         }
     }
     let mut health = Health::new(config.timing.max_silence)
-        .with_ping(config.timing.max_silence / 2, config.timing.max_silence / 2);
+        .with_ping(config.timing.max_silence / 2, config.timing.max_silence / 2)
+        .watch_route(Arc::clone(&config.network), &config.url, route);
     let mut connected = false;
     let mut last_sequence: Option<u64> = None;
     loop {
