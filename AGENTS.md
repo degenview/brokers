@@ -14,7 +14,9 @@ users; correctness and secrecy come before convenience.
   `http::HttpClient` (which scrubs) or `Scrubber`. `Credentials` has a redacted `Debug` on purpose.
 - **Writes.** A POST/DELETE is sent once. A write that did not finish is `ErrorKind::OutcomeUnknown`;
   only a lookup by `ClientOrderId` may resolve it. Never add an automatic retry to a write.
-- **Hosts.** Requests go to the adapter's own host only. Redirects are not followed. A base-URL
+- **Hosts.** Requests go to the adapter's own host only, through the `Network` the consumer supplies
+  (`Env::network()`); a proxy never changes the target host, and TLS ends at the broker. Open sockets
+  and build HTTP agents only in `net.rs` and `http.rs`: a guard test enforces it. Redirects are not followed. A base-URL
   override exists for debug and test builds, honours loopback addresses only, and must stay that way.
 - **No funds movement.** Do not add transfer, withdrawal, deposit, convert or send endpoints, or ask
   for a permission that enables them.
@@ -31,6 +33,7 @@ users; correctness and secrecy come before convenience.
 src/model/       pure types, validation, capabilities
 src/adapter.rs   Broker, Connection, Descriptor, Env
 src/auth/        the RequestSigner trait (a broker's signer lives in its module)
+src/net.rs       the Network port (Route, Proxy, Direct), implemented by the consumer
 src/http.rs      the HTTP client;  src/ws.rs  blocking WebSocket plumbing
 src/submit.rs    record, send once, reconcile
 src/model/reducer.rs, src/runtime.rs   the shared book and the per-broker runtime

@@ -1,8 +1,10 @@
-//! Test support shared with the application: a loopback mock exchange. Compiled only for this
+//! Test support shared with the application: a loopback mock exchange and doubles for the network
+//! port. Compiled only for this
 //! crate's tests and under the `testing` feature.
 
 pub mod conformance;
 pub mod mock;
+pub mod network;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 

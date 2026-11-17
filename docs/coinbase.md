@@ -164,6 +164,11 @@ key is available, and this list is updated when it is.
   order; both are handled as "look it up".
 * Regional availability. Nothing documents it beyond the per-product flags and the
   `GEOFENCING_RESTRICTION` order failure.
+* **Proxies (0.4).** REST and the user WebSocket go through whatever `Network` the application
+  supplies (HTTP `CONNECT`, SOCKS5 with remote DNS). This is tested only against an in-process
+  `CONNECT` proxy and loopback servers. That Coinbase's edge accepts requests and sockets arriving
+  from a given proxy's address, and that a SOCKS proxy works for the socket, is inferred, not
+  verified. A signed token is not bound to the client's address in the documentation.
 
 ## Limits worth knowing
 

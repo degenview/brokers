@@ -18,6 +18,7 @@ use crate::model::types::{
     AccountRef, Balance, BrokerId, ClientOrderId, LiveFill, LiveOrder, OrderDraft, OrderId,
     Permissions, ProductId, ProductSpec, Quote,
 };
+use crate::net::{Direct, Network};
 use crate::secret::Credentials;
 
 /// How a credential field is entered, so a form can render it.
@@ -185,6 +186,7 @@ impl StreamTiming {
 pub struct Env {
     pub clock: Arc<dyn Clock>,
     pub stream_timing: StreamTiming,
+    network: Arc<dyn Network>,
     base_url: Option<String>,
     ws_url: Option<String>,
     request_gap: Option<Duration>,
@@ -195,6 +197,7 @@ impl Default for Env {
         Self {
             clock: Arc::new(SystemClock),
             stream_timing: StreamTiming::default(),
+            network: Arc::new(Direct),
             base_url: None,
             ws_url: None,
             request_gap: None,
@@ -206,6 +209,19 @@ impl Env {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Routes every connection through `network` instead of connecting directly. The network is
+    /// consulted again for each request, so it can change its answer while connections are open.
+    #[must_use]
+    pub fn with_network(mut self, network: Arc<dyn Network>) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// The network connections are made through ([`Direct`] unless [`Env::with_network`] set one).
+    pub fn network(&self) -> &Arc<dyn Network> {
+        &self.network
     }
 
     /// Points the adapter at a local mock exchange. Present only in debug and test builds, and

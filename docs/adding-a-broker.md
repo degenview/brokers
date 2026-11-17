@@ -45,6 +45,13 @@ after it, re-read after gaps, sleep and unknown outcomes), the submit/reconcile 
 journal, validation against product rules, redacted credentials, and the HTTP client's retry and
 no-redirect rules.
 
+**Connections.** Never open a socket or build an HTTP agent yourself (a guard test fails the build
+if you do): the consumer may route everything through a proxy. Build requests with
+`HttpClient::new(.., Arc::clone(env.network()))`, and open the stream's socket with
+`ws::connect(url, read_timeout, network)`, then give the `Health` it returns the route with
+`watch_route(network, url, route)`, so the stream reconnects when the route changes. Keep the
+`Arc<dyn Network>` from `Env` in your connection for that.
+
 The first account of the `Session` your connection returns is the account every journal entry is
 scoped to, so its id must be non-empty and the same for the same credential every time (a
 portfolio id, not a random one); `Exchange::account` in the conformance suite must return it. A

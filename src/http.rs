@@ -7,6 +7,9 @@
 //!   order up before doing anything else.
 //! * Every request is signed fresh, spaced by the broker's minimum gap, and every error detail is
 //!   scrubbed of credentials before it leaves this module.
+//! * Every request asks the [`Network`] which route to take, so a proxy setting that changes is
+//!   followed by the next request. A proxy that cannot be used stops the request; it never falls
+//!   back to a direct connection.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,6 +18,7 @@ use serde_json::Value;
 
 use crate::auth::{RequestParts, RequestSigner};
 use crate::error::{BrokerError, ErrorKind, Result};
+use crate::net::{self, Network, Route};
 use crate::scrub::Scrubber;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -117,8 +121,69 @@ impl RateLimiter {
 
 type Sleeper = dyn Fn(Duration) + Send + Sync;
 
+/// A `ureq` agent that follows the [`Network`]'s route.
+///
+/// The agent (and the connection pool in it) is kept while the route stays the same and rebuilt
+/// only when it changes, so pooling still works and a changed setting is followed live.
+struct RoutedAgent {
+    network: Arc<dyn Network>,
+    /// The address routes are asked for.
+    url: String,
+    current: Mutex<Option<(Route, ureq::Agent)>>,
+    #[cfg(test)]
+    builds: std::sync::atomic::AtomicUsize,
+}
+
+impl RoutedAgent {
+    fn new(network: Arc<dyn Network>, url: &str) -> Self {
+        Self {
+            network,
+            url: url.to_owned(),
+            current: Mutex::new(None),
+            #[cfg(test)]
+            builds: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The agent for the route the network names right now. An error means the route's proxy
+    /// cannot be used and nothing may be sent.
+    fn agent(&self) -> Result<ureq::Agent, ureq::Error> {
+        let route = self.network.route(&self.url);
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((built_for, agent)) = current.as_ref()
+            && *built_for == route
+        {
+            return Ok(agent.clone());
+        }
+        let agent = build_agent(&route)?;
+        #[cfg(test)]
+        self.builds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *current = Some((route, agent.clone()));
+        Ok(agent)
+    }
+}
+
+/// An agent with this crate's request rules (no redirects, statuses are not errors) that goes
+/// through `route`. The proxy is always set explicitly, so a direct route is direct whatever the
+/// process environment says.
+fn build_agent(route: &Route) -> Result<ureq::Agent, ureq::Error> {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(TIMEOUT))
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .http_status_as_error(false)
+        .user_agent(concat!("degenview-brokers/", env!("CARGO_PKG_VERSION")))
+        .proxy(net::to_ureq(route)?)
+        .build();
+    Ok(ureq::Agent::new_with_config(config))
+}
+
 pub struct HttpClient {
-    agent: ureq::Agent,
+    agent: RoutedAgent,
     base: String,
     authority: String,
     signer: Arc<dyn RequestSigner>,
@@ -128,23 +193,18 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    /// `base` is `https://host` with no trailing slash.
+    /// `base` is `https://host` with no trailing slash. Requests go where `network` routes them.
     pub fn new(
         base: &str,
         signer: Arc<dyn RequestSigner>,
         scrubber: Scrubber,
         min_gap: Duration,
+        network: Arc<dyn Network>,
     ) -> Self {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(TIMEOUT))
-            .max_redirects(0)
-            .max_redirects_will_error(false)
-            .http_status_as_error(false)
-            .user_agent(concat!("degenview-brokers/", env!("CARGO_PKG_VERSION")))
-            .build();
+        let base = base.trim_end_matches('/');
         Self {
-            agent: ureq::Agent::new_with_config(config),
-            base: base.trim_end_matches('/').to_owned(),
+            agent: RoutedAgent::new(network, base),
+            base: base.to_owned(),
             authority: authority_of(base).to_owned(),
             signer,
             scrubber,
@@ -227,9 +287,13 @@ impl HttpClient {
             path,
         })?;
         let url = format!("{}{}{}", self.base, path, query_string(query));
+        let agent = match self.agent.agent() {
+            Ok(agent) => agent,
+            Err(_) => return Err(self.proxy_error(method, path)),
+        };
 
         let result = if let Some(body) = body {
-            let mut request = self.agent.post(&url).header("Accept", "application/json");
+            let mut request = agent.post(&url).header("Accept", "application/json");
             for (name, value) in &headers {
                 request = request.header(name, value);
             }
@@ -237,7 +301,7 @@ impl HttpClient {
                 .header("Content-Type", "application/json")
                 .send(body.to_string().as_bytes())
         } else {
-            let mut request = self.agent.get(&url).header("Accept", "application/json");
+            let mut request = agent.get(&url).header("Accept", "application/json");
             for (name, value) in &headers {
                 request = request.header(name, value);
             }
@@ -291,6 +355,18 @@ impl HttpClient {
     fn detail(&self, method: &str, path: &str, status: u16, note: &str) -> String {
         self.scrubber
             .scrub(&format!("{method} {path} -> HTTP {status}: {note}"))
+    }
+
+    /// The route's proxy could not be used, so nothing was sent (not even for a write). The text
+    /// of the underlying error is left out: it may quote the proxy's address and credentials.
+    fn proxy_error(&self, method: &str, path: &str) -> BrokerError {
+        BrokerError::new(
+            ErrorKind::Invalid,
+            "The proxy settings cannot be used, so nothing was sent.",
+        )
+        .with_detail(format!(
+            "{method} {path}: the proxy could not be configured"
+        ))
     }
 
     fn transport_error(
@@ -428,6 +504,7 @@ fn jitter_seed() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::Direct;
     use crate::testing::mock::{MockServer, Reply};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -450,6 +527,7 @@ mod tests {
             Arc::new(StaticSigner),
             Scrubber::new(["hunter2-secret"]),
             Duration::ZERO,
+            Arc::new(Direct),
         )
         .with_sleeper(|_| {})
     }
@@ -659,5 +737,141 @@ mod tests {
         limiter.wait();
         limiter.wait();
         assert!(start.elapsed() >= Duration::from_millis(80));
+    }
+}
+
+/// The client follows the route its [`Network`] names.
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::net::{Proxy, ProxyProtocol};
+    use crate::testing::mock::{MockServer, Reply};
+    use crate::testing::network::{ConnectProxy, ScriptedNetwork};
+    use std::process::Command;
+    use std::sync::atomic::Ordering;
+
+    struct NoSignature;
+    impl RequestSigner for NoSignature {
+        fn headers(&self, _request: &RequestParts<'_>) -> Result<Vec<(String, String)>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn server() -> MockServer {
+        MockServer::start(|_| Reply::json(200, r#"{"ok":true}"#))
+    }
+
+    fn client(server: &MockServer, network: Arc<dyn Network>) -> HttpClient {
+        HttpClient::new(
+            &server.url,
+            Arc::new(NoSignature),
+            Scrubber::new(std::iter::empty::<&str>()),
+            Duration::ZERO,
+            network,
+        )
+        .with_sleeper(|_| {})
+    }
+
+    fn builds(client: &HttpClient) -> usize {
+        client.agent.builds.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_request_through_a_proxy_is_tunnelled_to_the_server() {
+        let server = server();
+        let proxy = ConnectProxy::start();
+        let network = Arc::new(ScriptedNetwork::new(proxy.route()));
+        let value = client(&server, network).get("/v/things", &[]).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(server.requests()[0].target, "/v/things");
+        let lines = proxy.request_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let target = server.url.trim_start_matches("http://");
+        assert_eq!(lines[0], format!("CONNECT {target} HTTP/1.1"));
+    }
+
+    #[test]
+    fn a_route_that_changes_is_followed_by_the_next_request() {
+        let server = server();
+        let proxy = ConnectProxy::start();
+        let network = Arc::new(ScriptedNetwork::new(Route::Direct));
+        let client = client(&server, network.clone());
+
+        client.get("/a", &[]).unwrap();
+        assert!(proxy.request_lines().is_empty());
+        network.set_route(proxy.route());
+        client.get("/b", &[]).unwrap();
+        assert_eq!(proxy.request_lines().len(), 1);
+        network.set_route(Route::Direct);
+        client.get("/c", &[]).unwrap();
+        assert_eq!(proxy.request_lines().len(), 1);
+        assert_eq!(server.request_count(), 3);
+    }
+
+    #[test]
+    fn the_agent_is_rebuilt_only_when_the_route_changes() {
+        let server = server();
+        let proxy = ConnectProxy::start();
+        let network = Arc::new(ScriptedNetwork::new(Route::Direct));
+        let client = client(&server, network.clone());
+
+        for path in ["/a", "/b", "/c"] {
+            client.get(path, &[]).unwrap();
+        }
+        assert_eq!(builds(&client), 1);
+        assert_eq!(network.routes_asked(), 3, "asked once per request");
+        network.set_route(proxy.route());
+        client.get("/d", &[]).unwrap();
+        client.get("/e", &[]).unwrap();
+        assert_eq!(builds(&client), 2);
+    }
+
+    #[test]
+    fn an_unusable_proxy_stops_every_request_and_nothing_is_sent() {
+        let server = server();
+        let broken = Route::Proxy(Proxy::new(ProxyProtocol::Http, "bad host/", 8080));
+        let client = client(&server, Arc::new(ScriptedNetwork::new(broken)));
+
+        let read = client.get("/x", &[]).unwrap_err();
+        let write = client.post("/x", &serde_json::json!({})).unwrap_err();
+        assert_eq!(read.kind, ErrorKind::Invalid);
+        assert_eq!(
+            write.kind,
+            ErrorKind::Invalid,
+            "a write that never left is not unknown"
+        );
+        assert_eq!(server.request_count(), 0);
+    }
+
+    /// `ureq` reads `*_PROXY` variables for an agent built without a proxy; a direct route must
+    /// not. Run in a child process, because a test cannot set variables for itself.
+    const ENV_CHILD: &str = "http::route_tests::direct_agent_has_no_proxy_whatever_the_environment";
+
+    #[test]
+    fn a_direct_route_is_direct_even_when_a_proxy_variable_is_set() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", ENV_CHILD, "--ignored", "--nocapture"])
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .output()
+            .expect("run the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child test did not pass:\n{stdout}"
+        );
+    }
+
+    /// The body of [`a_direct_route_is_direct_even_when_a_proxy_variable_is_set`]; ignored so it
+    /// only runs in the child process that has the variable.
+    #[test]
+    #[ignore = "runs in a child process with ALL_PROXY set"]
+    fn direct_agent_has_no_proxy_whatever_the_environment() {
+        let defaults = ureq::Agent::config_builder().build();
+        assert!(
+            defaults.proxy().is_some(),
+            "the variable must be visible to ureq"
+        );
+        let agent = build_agent(&Route::Direct).unwrap();
+        assert!(agent.config().proxy().is_none());
     }
 }

@@ -10,6 +10,8 @@ use super::fake::{
 use crate::adapter::{Broker, Connection, Env, StreamTiming};
 use crate::model::events::{EventSink, StreamEvent};
 use crate::model::types::OrderStatus;
+use crate::net::{Direct, Network, Proxy, ProxyProtocol, Route};
+use crate::testing::network::ScriptedNetwork;
 
 #[derive(Default)]
 struct Collector(Mutex<Vec<StreamEvent>>);
@@ -45,6 +47,23 @@ fn connection(rest: &FakeCoinbase, stream: &FakeStream) -> Box<dyn Connection> {
                 .with_loopback_base_url(rest.url())
                 .with_loopback_ws_url(stream.url.clone())
                 .with_stream_timing(StreamTiming::fast()),
+        )
+        .unwrap()
+}
+
+fn connection_via(
+    rest: &FakeCoinbase,
+    stream: &FakeStream,
+    network: Arc<dyn Network>,
+) -> Box<dyn Connection> {
+    Coinbase
+        .connect(
+            &credentials(&generate_key_pem()),
+            &Env::default()
+                .with_loopback_base_url(rest.url())
+                .with_loopback_ws_url(stream.url.clone())
+                .with_stream_timing(StreamTiming::fast())
+                .with_network(network),
         )
         .unwrap()
 }
@@ -318,4 +337,42 @@ fn a_server_error_that_echoes_the_subscription_is_scrubbed_and_short() {
         "a server's words are cut short: {} characters",
         reason.chars().count()
     );
+}
+
+#[test]
+fn the_stream_is_dialled_through_the_network_and_reconnects_when_the_route_changes() {
+    let rest = FakeCoinbase::start();
+    let stream = FakeStream::start();
+    let network = Arc::new(ScriptedNetwork::new(Route::Direct));
+    let sink = Arc::new(Collector::default());
+    let mut handle = connection_via(&rest, &stream, network.clone())
+        .open_stream(sink.clone())
+        .unwrap();
+    sink.wait_for("the first connection", |e| connected_count(e) == 1);
+    assert_eq!(network.dialled().len(), 1);
+
+    // A new route (any other one) fails the open socket, and the stream connects again.
+    network.set_route(Route::Proxy(Proxy::new(
+        ProxyProtocol::Http,
+        "proxy.example",
+        3128,
+    )));
+    sink.wait_for("the second connection", |e| connected_count(e) == 2);
+    assert_eq!(network.dialled().len(), 2);
+    assert!(sink.events().iter().any(
+        |e| matches!(e, StreamEvent::Disconnected { reason } if reason.contains("route changed"))
+    ));
+    handle.stop();
+}
+
+#[test]
+fn a_stream_on_the_default_network_connects_directly() {
+    let rest = FakeCoinbase::start();
+    let stream = FakeStream::start();
+    let sink = Arc::new(Collector::default());
+    let mut handle = connection_via(&rest, &stream, Arc::new(Direct))
+        .open_stream(sink.clone())
+        .unwrap();
+    sink.wait_for("the connection", |e| connected_count(e) == 1);
+    handle.stop();
 }

@@ -1,6 +1,6 @@
 [package]
 name = "degenview-brokers"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A venue-neutral trading model and broker adapters for DegenView, with Coinbase Advanced Trade first."
@@ -28,7 +28,8 @@ rust_decimal = { version = "1.43.0", default-features = false, features = ["std"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # Blocking HTTP with rustls and no redirects (see `http`). Matches the application's version.
-ureq = "3.4.2"
+# `socks-proxy` lets a `net::Route` go through a SOCKS proxy; it pulls in no further crate.
+ureq = { version = "3.4.2", features = ["socks-proxy"] }
 # Blocking WebSockets for account streams. Same version and TLS roots as the application.
 tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 # JWT signing (ES256 and Ed25519). Already in the application's tree through rustls.
